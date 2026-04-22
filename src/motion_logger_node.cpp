@@ -27,7 +27,7 @@
  *   ee_frame    : EE 링크명       (기본 "tool0")
  *   min_delta_m   : EE 노이즈 임계값   [m]   (기본 0.0001)
  *   min_delta_rad : 관절 노이즈 임계값 [rad] (기본 0.0001)
- *   log_dir     : CSV 저장 디렉토리   (기본 "/tmp")
+ *   log_dir     : CSV 저장 디렉토리   (기본 "<source_dir>/data", CMake 컴파일 타임 고정)
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -35,8 +35,6 @@
 #include <std_msgs/msg/bool.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <ament_index_cpp/get_package_share_directory.hpp>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -64,25 +62,14 @@ public:
   MotionLoggerNode()
   : Node("motion_logger_node")
   {
-    // ── 기본 저장 경로: <package_share>/data ─────────────────────
-    // ament_index_cpp 로 패키지 share 디렉토리를 조회하여
-    // data 하위 폴더를 기본값으로 설정.
-    // 패키지를 찾지 못하면 /tmp 를 fallback 으로 사용.
-    std::string default_log_dir = "/tmp";
-    try {
-      default_log_dir =
-        ament_index_cpp::get_package_share_directory("pick_place_module")
-        + "/data";
-    } catch (const std::exception & e) {
-      RCLCPP_WARN(get_logger(),
-        "Cannot find package share dir: %s — falling back to /tmp", e.what());
-    }
-
+    // ── 기본 저장 경로: <source_dir>/data ────────────────────────
+    // PICK_PLACE_DATA_DIR 은 CMakeLists.txt 의 CMAKE_CURRENT_SOURCE_DIR/data
+    // 로 컴파일 타임에 고정된다. install/ 경로가 아닌 소스 경로에 저장.
     declare_parameter<std::string>("base_frame",    "base_link");
     declare_parameter<std::string>("ee_frame",      "tool0");
     declare_parameter<double>     ("min_delta_m",   1e-4);
     declare_parameter<double>     ("min_delta_rad", 1e-4);
-    declare_parameter<std::string>("log_dir",       default_log_dir);
+    declare_parameter<std::string>("log_dir",       PICK_PLACE_DATA_DIR);
 
     base_frame_    = get_parameter("base_frame").as_string();
     ee_frame_      = get_parameter("ee_frame").as_string();

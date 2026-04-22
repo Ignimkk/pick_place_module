@@ -11,10 +11,16 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 
 # ---------------------------------------------------------------
+# 데이터 저장 경로 (소스 디렉터리 기준)
+# motion_logger_node / rrt_path_recorder_node 양쪽이 동일 경로를 사용.
+# CMAKE_CURRENT_SOURCE_DIR = .../src/pick_place_module
+# ---------------------------------------------------------------
+set(PICK_PLACE_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data")
+
+# ---------------------------------------------------------------
 # 의존성 찾기
 # ---------------------------------------------------------------
 find_package(ament_cmake REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -87,12 +93,14 @@ target_link_libraries(pick_place_node "${cpp_typesupport_target}")
 add_executable(motion_logger_node src/motion_logger_node.cpp)
 ament_target_dependencies(motion_logger_node
   rclcpp
-  ament_index_cpp
   std_msgs
   sensor_msgs
   geometry_msgs
   tf2_ros
   tf2_geometry_msgs
+)
+target_compile_definitions(motion_logger_node PRIVATE
+  PICK_PLACE_DATA_DIR="${PICK_PLACE_DATA_DIR}"
 )
 
 # ---------------------------------------------------------------
@@ -108,6 +116,21 @@ ament_target_dependencies(ee_pose_publisher
 )
 
 # ---------------------------------------------------------------
+# rrt_path_recorder_node
+# 역할: /pick_place/rrt_trajectory 구독 → CSV 파일 저장
+#       pick_place_node 가 RRTConnect 계획 성공 직후 publish 하는
+#       moveit_msgs/RobotTrajectory 를 수신하여 waypoints 를 기록.
+# ---------------------------------------------------------------
+add_executable(rrt_path_recorder_node src/rrt_path_recorder_node.cpp)
+ament_target_dependencies(rrt_path_recorder_node
+  rclcpp
+  moveit_msgs
+)
+target_compile_definitions(rrt_path_recorder_node PRIVATE
+  PICK_PLACE_DATA_DIR="${PICK_PLACE_DATA_DIR}"
+)
+
+# ---------------------------------------------------------------
 # 설치
 # ---------------------------------------------------------------
 install(
@@ -116,6 +139,7 @@ install(
     pick_place_node
     motion_logger_node
     ee_pose_publisher
+    rrt_path_recorder_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

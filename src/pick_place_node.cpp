@@ -186,6 +186,12 @@ public:
     motion_log_pub_ = create_publisher<std_msgs::msg::Bool>(
       "/motion_logger/record", 10);
 
+    // ── RRT 궤적 publisher ────────────────────────────────────────
+    // rrt_path_recorder_node 에서 구독하여 CSV 로 저장.
+    // joint_trajectory.header.frame_id = step_name (pre_grasp / pre_place).
+    rrt_traj_pub_ = create_publisher<moveit_msgs::msg::RobotTrajectory>(
+      "/pick_place/rrt_trajectory", 10);
+
     RCLCPP_INFO(get_logger(), "PickPlaceNode ready  |  /pick  /place");
   }
 
@@ -380,7 +386,14 @@ private:
       plan.planning_time_,
       plan.trajectory_.joint_trajectory.points.size());
 
-    // ── 7. 실행 ──────────────────────────────────────────────────
+    // ── 7. RRT 궤적 publish (rrt_path_recorder_node 가 CSV 저장) ─
+    // frame_id 에 step_name 을 임시 태깅 — 이 토픽은 TF/MoveIt 이 소비하지 않음.
+    auto pub_traj = plan.trajectory_;
+    pub_traj.joint_trajectory.header.frame_id = step_name;
+    pub_traj.joint_trajectory.header.stamp    = this->now();
+    rrt_traj_pub_->publish(pub_traj);
+
+    // ── 9. 실행 ──────────────────────────────────────────────────
     const auto exec_result = move_group_->execute(plan);
     if (!exec_result) {
       RCLCPP_ERROR(get_logger(),
@@ -609,6 +622,9 @@ private:
 
   // motion_logger_node 트리거: RRT 구간 시작(true)/종료(false)
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr motion_log_pub_;
+
+  // rrt_path_recorder_node 용: RRT 궤적 publish
+  rclcpp::Publisher<moveit_msgs::msg::RobotTrajectory>::SharedPtr rrt_traj_pub_;
 
   rclcpp::CallbackGroup::SharedPtr pick_cbg_;
   rclcpp::CallbackGroup::SharedPtr place_cbg_;

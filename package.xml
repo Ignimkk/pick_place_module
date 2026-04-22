@@ -16,7 +16,6 @@
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
   <!-- 빌드 및 실행 의존성 -->
-  <depend>ament_index_cpp</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>
   <depend>std_msgs</depend>
