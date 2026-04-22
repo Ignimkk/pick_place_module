@@ -28,6 +28,7 @@ find_package(control_msgs REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(moveit_core REQUIRED)
 find_package(moveit_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -77,6 +78,7 @@ ament_target_dependencies(pick_place_node
   rclcpp
   rclcpp_action
   std_msgs
+  nav_msgs
   geometry_msgs
   control_msgs
   moveit_ros_planning_interface
@@ -116,6 +118,22 @@ ament_target_dependencies(ee_pose_publisher
 )
 
 # ---------------------------------------------------------------
+# ee_path_visualizer_node
+# 역할: EE 궤적 RViz 시각화
+#   /ee_path/planned : RRT 계획 경로 (FK 변환, Method B)
+#   /ee_path/actual  : 실제 실행 경로 (TF 폴링, Method C)
+# ---------------------------------------------------------------
+add_executable(ee_path_visualizer_node src/ee_path_visualizer_node.cpp)
+ament_target_dependencies(ee_path_visualizer_node
+  rclcpp
+  nav_msgs
+  std_msgs
+  geometry_msgs
+  tf2_ros
+  tf2_geometry_msgs
+)
+
+# ---------------------------------------------------------------
 # rrt_path_recorder_node
 # 역할: /pick_place/rrt_trajectory 구독 → CSV 파일 저장
 #       pick_place_node 가 RRTConnect 계획 성공 직후 publish 하는
@@ -140,6 +158,7 @@ install(
     motion_logger_node
     ee_pose_publisher
     rrt_path_recorder_node
+    ee_path_visualizer_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

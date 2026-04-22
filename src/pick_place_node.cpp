@@ -35,6 +35,7 @@
 #include <moveit/kinematics_base/kinematics_base.h>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <control_msgs/action/gripper_command.hpp>
 #include <std_msgs/msg/bool.hpp>
 
@@ -191,6 +192,12 @@ public:
     // joint_trajectory.header.frame_id = step_name (pre_grasp / pre_place).
     rrt_traj_pub_ = create_publisher<moveit_msgs::msg::RobotTrajectory>(
       "/pick_place/rrt_trajectory", 10);
+
+    // ── EE 계획 경로 publisher ────────────────────────────────────
+    // RRT 계획 직후 FK 로 EE 위치를 계산하여 RViz Path 로 publish.
+    // transient_local: RViz 가 나중에 subscribe 해도 마지막 Path 를 수신.
+    ee_path_planned_pub_ = create_publisher<nav_msgs::msg::Path>(
+      "/ee_path/planned", rclcpp::QoS(1).transient_local());
 
     RCLCPP_INFO(get_logger(), "PickPlaceNode ready  |  /pick  /place");
   }
@@ -393,7 +400,12 @@ private:
     pub_traj.joint_trajectory.header.stamp    = this->now();
     rrt_traj_pub_->publish(pub_traj);
 
-    // ── 9. 실행 ──────────────────────────────────────────────────
+    // ── 8. FK → EE 경로 publish (/ee_path/planned) ───────────────
+    // MoveGroupInterface 가 이미 보유한 robot model 을 재사용.
+    // ee_path_visualizer_node 의 RobotModelLoader 보다 확실하게 동작함.
+    publishEePath(plan, step_name);
+
+    // ── 10. 실행 ─────────────────────────────────────────────────
     const auto exec_result = move_group_->execute(plan);
     if (!exec_result) {
       RCLCPP_ERROR(get_logger(),
@@ -402,6 +414,65 @@ private:
     }
     RCLCPP_INFO(get_logger(), "[%s] Done", step_name.c_str());
     return true;
+  }
+
+  // ── FK → /ee_path/planned publish ───────────────────────────
+  //
+  // move_group_->getRobotModel() 로 이미 로드된 robot model 을 재사용.
+  // RobotModelLoader 를 별도로 띄우지 않아도 되므로 robot_description
+  // 파라미터 접근 문제가 없다.
+  void publishEePath(const MoveGroupIface::Plan & plan,
+                     const std::string & step_name)
+  {
+    const auto robot_model = move_group_->getRobotModel();
+    if (!robot_model) {
+      RCLCPP_WARN(get_logger(),
+        "[%s] Robot model unavailable — /ee_path/planned skipped", step_name.c_str());
+      return;
+    }
+
+    moveit::core::RobotState fk_state(robot_model);
+    fk_state.setToDefaultValues();
+
+    const std::string ee_link = move_group_->getEndEffectorLink();
+    const auto & jt           = plan.trajectory_.joint_trajectory;
+
+    nav_msgs::msg::Path path;
+    path.header.frame_id = move_group_->getPlanningFrame();
+    path.header.stamp    = this->now();
+
+    for (const auto & pt : jt.points) {
+      // 이름→위치 맵: joint_names 순서와 robot model 내부 순서 불일치 방지
+      std::map<std::string, double> joint_map;
+      for (size_t i = 0;
+           i < jt.joint_names.size() && i < pt.positions.size(); ++i)
+      {
+        joint_map[jt.joint_names[i]] = pt.positions[i];
+      }
+
+      fk_state.setVariablePositions(joint_map);
+      fk_state.updateLinkTransforms();
+
+      const Eigen::Isometry3d & ee_tf = fk_state.getGlobalLinkTransform(ee_link);
+      const Eigen::Quaterniond   q(ee_tf.linear());
+
+      geometry_msgs::msg::PoseStamped ps;
+      ps.header             = path.header;
+      ps.pose.position.x    = ee_tf.translation().x();
+      ps.pose.position.y    = ee_tf.translation().y();
+      ps.pose.position.z    = ee_tf.translation().z();
+      ps.pose.orientation.w = q.w();
+      ps.pose.orientation.x = q.x();
+      ps.pose.orientation.y = q.y();
+      ps.pose.orientation.z = q.z();
+
+      path.poses.push_back(ps);
+    }
+
+    ee_path_planned_pub_->publish(path);
+    RCLCPP_INFO(get_logger(),
+      "[%s] EE planned path: %zu poses → /ee_path/planned",
+      step_name.c_str(), path.poses.size());
   }
 
   // ── Cartesian 직선 경로 계획 + 실행 ──────────────────────────
@@ -625,6 +696,9 @@ private:
 
   // rrt_path_recorder_node 용: RRT 궤적 publish
   rclcpp::Publisher<moveit_msgs::msg::RobotTrajectory>::SharedPtr rrt_traj_pub_;
+
+  // RViz 시각화용: FK 기반 EE 계획 경로
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr ee_path_planned_pub_;
 
   rclcpp::CallbackGroup::SharedPtr pick_cbg_;
   rclcpp::CallbackGroup::SharedPtr place_cbg_;
