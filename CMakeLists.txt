@@ -31,6 +31,7 @@ find_package(moveit_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
@@ -43,7 +44,8 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/Pick.action"
   "action/Place.action"
-  DEPENDENCIES geometry_msgs
+  "action/TrajOpt.action"
+  DEPENDENCIES geometry_msgs trajectory_msgs
 )
 
 # ---------------------------------------------------------------
@@ -81,6 +83,7 @@ ament_target_dependencies(pick_place_node
   nav_msgs
   geometry_msgs
   control_msgs
+  trajectory_msgs
   moveit_ros_planning_interface
   moveit_core
   moveit_msgs

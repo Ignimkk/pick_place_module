@@ -53,6 +53,44 @@ pick_place_node:
     # 매우 작은 값 → 현재 자세에 가까운 해를 선호하되 IK 수렴에 영향 최소화
     ik_cost_weight_l2: 0.0002
 
+    # ── Trajectory Optimization 통합 파라미터 ────────────────────
+    # use_trajopt=false (기본): 기존 MoveIt2 execute 동작 유지
+    # use_trajopt=true : RRT 계획 후 trajopt_server_node 로 최적화 수행
+    #
+    # 활성화 전 요구 사항:
+    #   1. ur_setup_ws 빌드 후 source (TrajOpt action 타입 생성)
+    #   2. trajopt_ws 빌드 후 source (trajopt_server_node 설치)
+    #   3. trajopt_server_node 실행:
+    #      ros2 run trajopt_validation trajopt_server_node
+
+    use_trajopt: false                  # true → TrajOpt 활성화
+
+    # trajopt_server_node 연결 대기 시간 [s]
+    # 서버가 없으면 MoveIt2 execute 로 폴백
+    trajopt_server_timeout_sec: 2.0
+
+    # 초기 시간 추정 [s] — solver의 T_init 값
+    # RRT trajectory 마지막 점의 시간이 이보다 크면 자동으로 대체됨
+    t_init_sec: 3.0
+
+    # Chebyshev 차수 N (노드 수 = N+1)
+    # N=6 → 7 노드, 43 결정변수, SLSQP ~0.3–1.0 s  ← 3초 예산 권장
+    # N=8 → 9 노드, 109 결정변수, SLSQP ~2–5 s
+    trajopt_N: 6
+
+    # reduced-space solver 사용 여부
+    # true : z=[q; T], 43 vars, 24 constraints → 빠름, 토크 한계 미강제
+    # false: x=[q; τ; T], 85 vars, 66 constraints → 느림, 토크 한계 강제
+    trajopt_use_reduced: true
+
+    # T_f 최적화 여부 (free-T NLP)
+    # true  → 궤적 시간을 최소화 대상으로 포함 (권장)
+    # false → T_init_sec 고정 (kinematic solve)
+    trajopt_use_free_t: true
+
+    # 실행 완료 여유 시간 [s] (T_opt + 이 값만큼 대기 후 다음 스텝 진행)
+    traj_exec_margin_sec: 1.5
+
 
 goal_relay_node:
   ros__parameters:

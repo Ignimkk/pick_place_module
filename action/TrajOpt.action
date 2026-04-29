@@ -1,0 +1,41 @@
+# TrajOpt.action
+#
+# Trajectory optimisation request sent from pick_place_node to
+# trajopt_server_node.
+#
+# RRT path is passed as flat float arrays to avoid cross-workspace
+# moveit_msgs dependencies.
+#
+# Solver target: ≤3 s total (goal received → JointTrajectory ready).
+# Recommended settings for the 3-s budget:
+#   N = 6, use_reduced = true, use_free_t = true
+#   → 43 decision vars, 24 equality constraints (SLSQP ~0.3–1.0 s)
+
+# ── Goal ───────────────────────────────────────────────────────────────────
+# RRT waypoints: K × 6 joint positions in row-major order.
+# Index mapping: q_waypoints[k*6 + j] = joint j at waypoint k.
+float64[] q_waypoints       # K×6 flat [rad]
+int32 num_waypoints         # K, must be ≥ 2
+float64[] timestamps        # K timestamps [s], monotonically increasing from 0
+
+# Boundary conditions
+float64[] q_start           # 6 start joint positions [rad]
+float64[] q_end             # 6 goal joint positions [rad]
+
+# Solver parameters
+float64 t_init              # initial time estimate [s]  (e.g. 3.0)
+int32 cheb_degree           # Chebyshev degree N (6 = 7 nodes, recommended)
+bool use_reduced            # true → reduced-space solver (q,T only); faster
+bool use_free_t             # true → optimise T_f (strongly recommended)
+---
+# ── Result ─────────────────────────────────────────────────────────────────
+bool success
+string message
+trajectory_msgs/JointTrajectory optimized_trajectory   # controller-ready
+float64 t_opt              # actual optimised trajectory time [s]
+float64 cost                # objective J value
+---
+# ── Feedback ───────────────────────────────────────────────────────────────
+string status
+float32 progress            # 0.0 – 1.0
+float64 elapsed_sec
