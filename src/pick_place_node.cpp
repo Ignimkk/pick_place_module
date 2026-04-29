@@ -57,9 +57,16 @@
 
 #include <Eigen/Dense>
 #include <chrono>
+#include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <iomanip>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -87,6 +94,215 @@ static const std::vector<std::string> UR_JOINT_NAMES = {
   "wrist_2_joint",
   "wrist_3_joint",
 };
+
+// ─────────────────────────────────────────────────────────────────────────
+// 실험 프레임워크 — 구조체 및 헬퍼
+// ─────────────────────────────────────────────────────────────────────────
+
+static double durationSec(
+  const std::chrono::steady_clock::time_point & a,
+  const std::chrono::steady_clock::time_point & b)
+{
+  return std::chrono::duration<double>(b - a).count();
+}
+
+struct TrajectoryMetrics {
+  int    num_points        = 0;
+  double duration_sec      = 0.0;
+  double joint_path_length = 0.0;   // sum ||Δq||_2
+  double mean_vel          = 0.0;
+  double max_vel           = 0.0;
+  double mean_accel        = 0.0;
+  double max_accel         = 0.0;
+  double mean_jerk         = 0.0;
+  double max_jerk          = 0.0;
+};
+
+struct ExperimentRecord {
+  int         trial_id           = 0;
+  std::string step_name;
+  std::string experiment_mode;
+  bool        success            = false;
+  bool        fallback_used      = false;
+  double      ik_time_sec        = 0.0;
+  double      rrt_planning_sec   = 0.0;
+  double      shortcut_time_sec  = 0.0;
+  double      guess_time_sec     = 0.0;
+  double      solve_time_sec     = 0.0;
+  double      total_compute_sec  = 0.0;
+  double      exec_wait_sec      = 0.0;
+  int         num_rrt_points     = 0;
+  int         num_shortcut_pts   = 0;
+  int         num_opt_points     = 0;
+  TrajectoryMetrics traj;
+  double      mean_torque        = 0.0;
+  double      max_torque         = 0.0;
+  double      mean_torque_rate   = 0.0;
+  double      max_torque_rate    = 0.0;
+  double      max_constr_viol    = 0.0;
+  double      final_cost         = 0.0;
+  std::string solver_status;
+  std::string message;
+};
+
+static TrajectoryMetrics computeTrajectoryMetrics(
+  const trajectory_msgs::msg::JointTrajectory & jt)
+{
+  TrajectoryMetrics m;
+  const int K = static_cast<int>(jt.points.size());
+  if (K < 2) return m;
+  m.num_points = K;
+
+  auto toSec = [](const builtin_interfaces::msg::Duration & d) {
+    return static_cast<double>(d.sec) + d.nanosec * 1e-9;
+  };
+
+  m.duration_sec = toSec(jt.points.back().time_from_start);
+  const int nj   = static_cast<int>(jt.points[0].positions.size());
+
+  // path length
+  double path = 0.0;
+  for (int k = 1; k < K; ++k) {
+    double sq = 0.0;
+    for (int j = 0; j < nj; ++j) {
+      double d = jt.points[k].positions[j] - jt.points[k-1].positions[j];
+      sq += d * d;
+    }
+    path += std::sqrt(sq);
+  }
+  m.joint_path_length = path;
+
+  // get velocity at (k, j) — use stored or finite-diff
+  auto getVel = [&](int k, int j) -> double {
+    if (!jt.points[k].velocities.empty())
+      return jt.points[k].velocities[j];
+    if (k == 0 || k == K - 1) return 0.0;
+    double dt = toSec(jt.points[k+1].time_from_start)
+              - toSec(jt.points[k-1].time_from_start);
+    if (dt < 1e-9) return 0.0;
+    return (jt.points[k+1].positions[j] - jt.points[k-1].positions[j]) / dt;
+  };
+
+  // get acceleration at (k, j)
+  auto getAccel = [&](int k, int j) -> double {
+    if (!jt.points[k].accelerations.empty())
+      return jt.points[k].accelerations[j];
+    if (k == 0 || k == K - 1) return 0.0;
+    double dt = toSec(jt.points[k+1].time_from_start)
+              - toSec(jt.points[k-1].time_from_start);
+    if (dt < 1e-9) return 0.0;
+    return (getVel(k+1, j) - getVel(k-1, j)) / dt;
+  };
+
+  double sv = 0.0, sa = 0.0, sj = 0.0;
+  double mv = 0.0, ma = 0.0, mj = 0.0;
+  int    cv = 0,   ca = 0,   cj = 0;
+
+  for (int k = 0; k < K; ++k) {
+    for (int j = 0; j < nj; ++j) {
+      double v = std::abs(getVel(k, j));
+      sv += v; mv = std::max(mv, v); ++cv;
+      double a = std::abs(getAccel(k, j));
+      sa += a; ma = std::max(ma, a); ++ca;
+    }
+  }
+  // jerk: central-diff of acceleration
+  for (int k = 1; k < K - 1; ++k) {
+    double dt = toSec(jt.points[k+1].time_from_start)
+              - toSec(jt.points[k-1].time_from_start);
+    if (dt < 1e-9) continue;
+    for (int j = 0; j < nj; ++j) {
+      double jerk = std::abs((getAccel(k+1, j) - getAccel(k-1, j)) / dt);
+      sj += jerk; mj = std::max(mj, jerk); ++cj;
+    }
+  }
+
+  m.mean_vel   = (cv > 0) ? sv / cv : 0.0;
+  m.max_vel    = mv;
+  m.mean_accel = (ca > 0) ? sa / ca : 0.0;
+  m.max_accel  = ma;
+  m.mean_jerk  = (cj > 0) ? sj / cj : 0.0;
+  m.max_jerk   = mj;
+  return m;
+}
+
+class CsvLogger
+{
+public:
+  explicit CsvLogger(const std::string & path)
+  : path_(path)
+  {
+    namespace fs = std::filesystem;
+    fs::create_directories(fs::path(path_).parent_path());
+    const bool exists = fs::exists(path_);
+    ofs_.open(path_, std::ios::app);
+    if (!exists) writeHeader();
+  }
+
+  void write(const ExperimentRecord & r)
+  {
+    if (!ofs_.is_open()) return;
+    auto f = [&](double v) { return std::isnan(v) ? "nan" : std::to_string(v); };
+    ofs_ << r.trial_id                << ","
+         << r.step_name               << ","
+         << r.experiment_mode         << ","
+         << r.success                 << ","
+         << r.fallback_used           << ","
+         << f(r.ik_time_sec)          << ","
+         << f(r.rrt_planning_sec)     << ","
+         << f(r.shortcut_time_sec)    << ","
+         << f(r.guess_time_sec)       << ","
+         << f(r.solve_time_sec)       << ","
+         << f(r.total_compute_sec)    << ","
+         << f(r.exec_wait_sec)        << ","
+         << r.num_rrt_points          << ","
+         << r.num_shortcut_pts        << ","
+         << r.num_opt_points          << ","
+         << f(r.traj.duration_sec)    << ","
+         << f(r.traj.joint_path_length)<< ","
+         << f(r.traj.mean_vel)        << ","
+         << f(r.traj.max_vel)         << ","
+         << f(r.traj.mean_accel)      << ","
+         << f(r.traj.max_accel)       << ","
+         << f(r.traj.mean_jerk)       << ","
+         << f(r.traj.max_jerk)        << ","
+         << f(r.mean_torque)          << ","
+         << f(r.max_torque)           << ","
+         << f(r.mean_torque_rate)     << ","
+         << f(r.max_torque_rate)      << ","
+         << f(r.max_constr_viol)      << ","
+         << f(r.final_cost)           << ","
+         << r.solver_status           << ","
+         << r.message                 << "\n";
+    ofs_.flush();
+  }
+
+private:
+  void writeHeader() {
+    ofs_ << "trial_id,step_name,experiment_mode,success,fallback_used,"
+            "ik_time_sec,rrt_planning_sec,shortcut_time_sec,"
+            "initial_guess_time_sec,solve_time_sec,total_compute_sec,"
+            "exec_wait_sec,num_rrt_points,num_shortcut_waypoints,"
+            "num_optimized_points,trajectory_duration_sec,"
+            "joint_path_length,mean_joint_velocity,max_joint_velocity,"
+            "mean_joint_acceleration,max_joint_acceleration,"
+            "mean_joint_jerk,max_joint_jerk,"
+            "mean_torque,max_torque,mean_torque_rate,max_torque_rate,"
+            "max_constraint_violation,final_cost,solver_status,message\n";
+  }
+  std::string   path_;
+  std::ofstream ofs_;
+};
+
+static std::string defaultCsvPath()
+{
+  const char * home = std::getenv("HOME");
+  std::string dir   = home ? std::string(home) + "/.ros/pick_place_exp" : "/tmp/pick_place_exp";
+  std::time_t t     = std::time(nullptr);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", std::localtime(&t));
+  return dir + "/" + std::string(buf) + "_results.csv";
+}
 
 // ---------------------------------------------------------------------------
 
@@ -125,15 +341,21 @@ public:
     declare_parameter<double>("ik_cost_weight_l2",    0.0002);
 
     // ── TrajOpt 통합 파라미터 ────────────────────────────────────
-    // use_trajopt=false: 기존 MoveIt2 execute 동작 (기본)
-    // use_trajopt=true : TrajOpt Action server 로 최적화 후 직접 발행
     declare_parameter<bool>  ("use_trajopt",               false);
-    declare_parameter<double>("trajopt_server_timeout_sec", 2.0);   // 서버 연결 대기 [s]
-    declare_parameter<double>("t_init_sec",                 3.0);   // 초기 시간 추정 [s]
-    declare_parameter<int>   ("trajopt_N",                  6);     // Chebyshev 차수
-    declare_parameter<double>("traj_exec_margin_sec",       1.5);   // 실행 완료 여유 [s]
-    declare_parameter<bool>  ("trajopt_use_reduced",        true);  // reduced-space 솔버
-    declare_parameter<bool>  ("trajopt_use_free_t",         true);  // free-T 최적화
+    declare_parameter<double>("trajopt_server_timeout_sec", 2.0);
+    declare_parameter<double>("t_init_sec",                 3.0);
+    declare_parameter<int>   ("trajopt_N",                  6);
+    declare_parameter<double>("traj_exec_margin_sec",       1.5);
+    declare_parameter<bool>  ("trajopt_use_reduced",        true);
+    declare_parameter<bool>  ("trajopt_use_free_t",         true);
+
+    // ── 실험 모드 파라미터 ────────────────────────────────────
+    // "rrt_only"    : RRTConnect → MoveIt2 execute  (기준선)
+    // "trajopt_only": IK → TrajOpt (RRT 경로 미사용, Hermite 초기 추정)
+    // "rrt_trajopt" : RRTConnect → TrajOpt → publish  (기본)
+    declare_parameter<std::string>("experiment_mode", "rrt_trajopt");
+    // CSV 저장 경로 (비워두면 ~/.ros/pick_place_exp/TIMESTAMP_results.csv)
+    declare_parameter<std::string>("experiment_csv_path", "");
 
     // ── MoveGroupInterface 초기화 ────────────────────────────────
     const std::string arm = get_parameter("arm_group").as_string();
@@ -151,6 +373,8 @@ public:
     RCLCPP_INFO(get_logger(), "End effector link   : %s", move_group_->getEndEffectorLink().c_str());
     RCLCPP_INFO(get_logger(), "use_trajopt         : %s",
       get_parameter("use_trajopt").as_bool() ? "true" : "false");
+    RCLCPP_INFO(get_logger(), "experiment_mode     : %s",
+      get_parameter("experiment_mode").as_string().c_str());
 
     // ── callback groups ───────────────────────────────────────────
     gripper_cbg_  = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -211,6 +435,12 @@ public:
     ee_path_planned_pub_ = create_publisher<nav_msgs::msg::Path>(
       "/ee_path/planned", rclcpp::QoS(1).transient_local());
 
+    // ── CSV 로거 초기화 ───────────────────────────────────────────
+    std::string csv_path = get_parameter("experiment_csv_path").as_string();
+    if (csv_path.empty()) csv_path = defaultCsvPath();
+    csv_logger_ = std::make_shared<CsvLogger>(csv_path);
+    RCLCPP_INFO(get_logger(), "Experiment CSV      : %s", csv_path.c_str());
+
     RCLCPP_INFO(get_logger(), "PickPlaceNode ready  |  /pick  /place");
   }
 
@@ -266,17 +496,21 @@ private:
     motion_log_pub_->publish(msg);
   }
 
-  // ── TrajOpt Action client: RRT 계획 → 최적화 궤적 수신 ───────
+  // ── TrajOpt Action client ─────────────────────────────────────
   //
-  // plan 의 waypoint 를 TrajOpt goal 에 패킹하여 전송한다.
-  // 성공 시 optimized_trajectory 를 /joint_trajectory_controller 에 발행하고
-  // T_opt + traj_exec_margin_sec 동안 대기한다.
-  // 실패 또는 서버 미연결 시 false 반환 → 호출자가 폴백 결정.
+  // use_rrt_waypoints=true : RRT plan 의 waypoint 를 TrajOpt goal 에 패킹
+  // use_rrt_waypoints=false: K=0 전송 → 서버가 Cubic Hermite 초기 추정 사용
+  //                           (trajopt_only 모드)
+  //
+  // 성공 시 rec 에 서버 메트릭을 기록하고 optimized_trajectory 를 발행 후
+  // T_opt + traj_exec_margin_sec 대기. 실패 시 false 반환.
   bool runWithTrajopt(
     const MoveGroupIface::Plan & plan,
+    bool                         use_rrt_waypoints,
     const std::vector<double>  & q_start_joints,
     const std::vector<double>  & q_end_joints,
-    const std::string          & step_name)
+    const std::string          & step_name,
+    ExperimentRecord           & rec)
   {
     const double server_timeout = get_parameter("trajopt_server_timeout_sec").as_double();
     const double t_init         = get_parameter("t_init_sec").as_double();
@@ -295,51 +529,57 @@ private:
       return false;
     }
 
+    // ── joint 순서 인덱스 맵 (UR 순서 기준) ────────────────────
+    // trajopt_only(K=0) 에서도 q_start/q_end 재정렬에 사용
     const auto & jt = plan.trajectory_.joint_trajectory;
-    const size_t K  = jt.points.size();
-    if (K < 2) {
-      RCLCPP_WARN(get_logger(),
-        "[%s] RRT plan has < 2 points — MoveIt2 폴백", step_name.c_str());
-      return false;
-    }
-
-    // ── joint 순서 인덱스 맵 구성 ───────────────────────────────
-    // jt.joint_names 와 UR_JOINT_NAMES 순서가 다를 수 있으므로 재정렬
     std::vector<int> joint_idx(6, -1);
-    for (size_t j = 0; j < UR_JOINT_NAMES.size(); ++j) {
-      for (size_t k = 0; k < jt.joint_names.size(); ++k) {
-        if (jt.joint_names[k] == UR_JOINT_NAMES[j]) {
-          joint_idx[j] = static_cast<int>(k);
-          break;
+    if (!jt.joint_names.empty()) {
+      for (size_t j = 0; j < UR_JOINT_NAMES.size(); ++j) {
+        for (size_t k = 0; k < jt.joint_names.size(); ++k) {
+          if (jt.joint_names[k] == UR_JOINT_NAMES[j]) {
+            joint_idx[j] = static_cast<int>(k);
+            break;
+          }
         }
       }
+    } else {
+      // q_start_joints 가 이미 UR 순서라고 가정 (trajopt_only)
+      for (int j = 0; j < 6; ++j) joint_idx[j] = j;
     }
 
     // ── TrajOpt goal 구성 ────────────────────────────────────────
     TrajOpt::Goal trajopt_goal;
-    trajopt_goal.num_waypoints = static_cast<int32_t>(K);
-    trajopt_goal.t_init        = t_init;
-    trajopt_goal.cheb_degree   = static_cast<int32_t>(N_cheb);
-    trajopt_goal.use_reduced   = use_reduced;
-    trajopt_goal.use_free_t    = use_free_t;
+    trajopt_goal.t_init      = t_init;
+    trajopt_goal.cheb_degree = static_cast<int32_t>(N_cheb);
+    trajopt_goal.use_reduced = use_reduced;
+    trajopt_goal.use_free_t  = use_free_t;
 
-    // timestamps
-    trajopt_goal.timestamps.reserve(K);
-    for (const auto & pt : jt.points) {
-      double t = static_cast<double>(pt.time_from_start.sec)
-               + static_cast<double>(pt.time_from_start.nanosec) * 1e-9;
-      trajopt_goal.timestamps.push_back(t);
-    }
-
-    // q_waypoints (K×6, row-major, UR 순서)
-    trajopt_goal.q_waypoints.reserve(K * 6);
-    for (const auto & pt : jt.points) {
-      for (int j = 0; j < 6; ++j) {
-        int k = joint_idx[j];
-        trajopt_goal.q_waypoints.push_back(
-          (k >= 0 && static_cast<size_t>(k) < pt.positions.size())
-            ? pt.positions[k] : 0.0);
+    if (use_rrt_waypoints) {
+      const size_t K = jt.points.size();
+      if (K < 2) {
+        RCLCPP_WARN(get_logger(),
+          "[%s] RRT plan has < 2 points — TrajOpt 불가", step_name.c_str());
+        return false;
       }
+      trajopt_goal.num_waypoints = static_cast<int32_t>(K);
+      trajopt_goal.timestamps.reserve(K);
+      for (const auto & pt : jt.points) {
+        double t = static_cast<double>(pt.time_from_start.sec)
+                 + static_cast<double>(pt.time_from_start.nanosec) * 1e-9;
+        trajopt_goal.timestamps.push_back(t);
+      }
+      trajopt_goal.q_waypoints.reserve(K * 6);
+      for (const auto & pt : jt.points) {
+        for (int j = 0; j < 6; ++j) {
+          int k = joint_idx[j];
+          trajopt_goal.q_waypoints.push_back(
+            (k >= 0 && static_cast<size_t>(k) < pt.positions.size())
+              ? pt.positions[k] : 0.0);
+        }
+      }
+    } else {
+      // trajopt_only: K=0 → 서버가 Cubic Hermite 초기 추정 사용
+      trajopt_goal.num_waypoints = 0;
     }
 
     // q_start / q_end (UR 순서로 재정렬)
@@ -356,10 +596,10 @@ private:
     }
 
     RCLCPP_INFO(get_logger(),
-      "[%s] TrajOpt goal 전송 — K=%zu, t_init=%.2fs, N=%d, reduced=%s, free_t=%s",
-      step_name.c_str(), K, t_init, N_cheb,
-      use_reduced ? "true" : "false",
-      use_free_t  ? "true" : "false");
+      "[%s] TrajOpt goal 전송 — K=%d (%s), t_init=%.2fs, N=%d",
+      step_name.c_str(), trajopt_goal.num_waypoints,
+      use_rrt_waypoints ? "rrt_trajopt" : "trajopt_only",
+      t_init, N_cheb);
 
     // ── Goal 전송 + 결과 대기 ────────────────────────────────────
     auto promise_result = std::make_shared<
@@ -431,40 +671,70 @@ private:
     const auto & res = wrapped.result;
     if (!res->success) {
       RCLCPP_WARN(get_logger(),
-        "[%s] TrajOpt NLP 미수렴: %s — 결과 궤적으로 계속 진행",
+        "[%s] TrajOpt NLP 미수렴: %s — 현재 추정치로 계속 진행",
         step_name.c_str(), res->message.c_str());
-      // 미수렴이어도 현재 추정치를 실행 (SLSQP 은 partial solution 을 반환함)
     }
 
+    // ── 서버 메트릭 추출 → ExperimentRecord ─────────────────────
+    rec.shortcut_time_sec  = res->shortcut_time_sec;
+    rec.guess_time_sec     = res->initial_guess_time_sec;
+    rec.solve_time_sec     = res->solve_time_sec;
+    rec.num_shortcut_pts   = res->num_shortcut_waypoints;
+    rec.num_opt_points     = static_cast<int>(
+                               res->optimized_trajectory.points.size());
+    rec.final_cost         = res->cost;
+    rec.max_constr_viol    = res->max_constraint_violation;
+    rec.mean_torque        = res->mean_torque;
+    rec.max_torque         = res->max_torque;
+    rec.mean_torque_rate   = res->mean_torque_rate;
+    rec.max_torque_rate    = res->max_torque_rate;
+    rec.solver_status      = res->success ? "converged" : "partial";
+    rec.traj               = computeTrajectoryMetrics(res->optimized_trajectory);
+
     RCLCPP_INFO(get_logger(),
-      "[%s] TrajOpt 성공 — t_opt=%.3fs, J=%.4f",
-      step_name.c_str(), res->t_opt, res->cost);
+      "[%s] TrajOpt — t_opt=%.3fs, J=%.4f, τ_max=%.1fNm, sc=%d, opt=%d pts",
+      step_name.c_str(), res->t_opt, res->cost,
+      res->max_torque, res->num_shortcut_waypoints,
+      rec.num_opt_points);
 
     // ── 최적화 궤적 발행 + 실행 대기 ────────────────────────────
+    auto t_exec = std::chrono::steady_clock::now();
     traj_pub_->publish(res->optimized_trajectory);
-    RCLCPP_INFO(get_logger(),
-      "[%s] 최적화 궤적 발행 (%zu pts) — %.2fs + %.2fs margin 대기",
-      step_name.c_str(),
-      res->optimized_trajectory.points.size(),
-      res->t_opt, exec_margin);
-
     rclcpp::sleep_for(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::duration<double>(res->t_opt + exec_margin)));
+    rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
 
-    RCLCPP_INFO(get_logger(), "[%s] 실행 완료", step_name.c_str());
+    RCLCPP_INFO(get_logger(), "[%s] 실행 완료 (%.2fs 대기)", step_name.c_str(), rec.exec_wait_sec);
     return true;
   }
 
-  // ── setFromIK(IKCostFn) + RRTConnect 계획 + [선택] TrajOpt + 실행 ──
+  // ── IK + experiment_mode 분기 실행 ──────────────────────────
+  //
+  // experiment_mode:
+  //   "rrt_only"    → IK → RRTConnect → MoveIt2 execute
+  //   "trajopt_only"→ IK → TrajOpt (K=0, Hermite 초기 추정)
+  //   "rrt_trajopt" → IK → RRTConnect → TrajOpt → publish
+  //                   (TrajOpt 실패 시 MoveIt2 폴백)
+  //
+  // 결과는 rec 에 기록 후 csv_logger_ 에 씀.
   bool planAndExecuteWithIK(const geometry_msgs::msg::Pose & target,
                              const std::string & step_name)
   {
+    const std::string mode = get_parameter("experiment_mode").as_string();
+    ExperimentRecord rec;
+    rec.trial_id        = ++trial_id_;
+    rec.step_name       = step_name;
+    rec.experiment_mode = mode;
+
+    auto t_total_start = std::chrono::steady_clock::now();
+
     // ── 1. 현재 로봇 상태 취득 ────────────────────────────────
     auto robot_state = move_group_->getCurrentState(2.0);
     if (!robot_state) {
-      RCLCPP_ERROR(get_logger(),
-        "[%s] Failed to get current robot state", step_name.c_str());
+      RCLCPP_ERROR(get_logger(), "[%s] Failed to get current robot state", step_name.c_str());
+      rec.message = "get_current_state failed";
+      if (csv_logger_) csv_logger_->write(rec);
       return false;
     }
     const auto * jmg = robot_state->getJointModelGroup(
@@ -479,7 +749,7 @@ private:
     const double ik_timeout = get_parameter("ik_timeout").as_double();
     const double w_l2       = get_parameter("ik_cost_weight_l2").as_double();
 
-    // ── 3. target: base_link → world 변환 ──────────────────────
+    // ── 3. base_link → world 변환 ──────────────────────────────
     const Eigen::Isometry3d world_T_base =
       robot_state->getGlobalLinkTransform("base_link");
     Eigen::Isometry3d target_in_base = Eigen::Isometry3d::Identity();
@@ -501,103 +771,131 @@ private:
     target_world.orientation.z = q_world.z();
 
     RCLCPP_INFO(get_logger(),
-      "[%s] target base_link(%.3f, %.3f, %.3f) → world(%.3f, %.3f, %.3f)",
-      step_name.c_str(),
-      target.position.x, target.position.y, target.position.z,
+      "[%s][%s] target world(%.3f, %.3f, %.3f)",
+      step_name.c_str(), mode.c_str(),
       target_world.position.x, target_world.position.y, target_world.position.z);
 
-    // ── 4. IK 비용 함수 ──────────────────────────────────────
+    // ── 4. IK ──────────────────────────────────────────────────
     const auto ik_cost_fn =
       [w_l2, seed_state](
         const geometry_msgs::msg::Pose &,
-        const moveit::core::RobotState & solution_state,
+        const moveit::core::RobotState & sol_state,
         const moveit::core::JointModelGroup * jmg_arg,
         const std::vector<double> &) -> double
     {
-      std::vector<double> proposed;
-      solution_state.copyJointGroupPositions(jmg_arg, proposed);
-      return w_l2 * computeL2Norm(proposed, seed_state);
+      std::vector<double> prop;
+      sol_state.copyJointGroupPositions(jmg_arg, prop);
+      return w_l2 * computeL2Norm(prop, seed_state);
     };
 
-    // ── 5. setFromIK: 최대 3회 시도 ───────────────────────────
-    const int    max_ik_retries      = 3;
-    moveit::core::GroupStateValidityCallbackFn callback_fn;
+    moveit::core::GroupStateValidityCallbackFn cb_fn;
     bool                found_ik = false;
     std::vector<double> solution;
     auto base_state = move_group_->getCurrentState(2.0);
 
-    for (int attempt = 0; attempt < max_ik_retries && !found_ik; ++attempt) {
-      auto state_attempt = std::make_shared<moveit::core::RobotState>(*base_state);
-      if (attempt > 0) {
-        state_attempt->setToRandomPositions(jmg);
-        RCLCPP_INFO(get_logger(),
-          "[%s] IK attempt %d/%d — random seed",
-          step_name.c_str(), attempt + 1, max_ik_retries);
-      }
-      found_ik = state_attempt->setFromIK(
-        jmg, target_world, ik_timeout, callback_fn, ik_opts, ik_cost_fn);
-      if (found_ik) {
-        state_attempt->copyJointGroupPositions(jmg, solution);
-      }
+    auto t_ik_start = std::chrono::steady_clock::now();
+    for (int att = 0; att < 3 && !found_ik; ++att) {
+      auto st = std::make_shared<moveit::core::RobotState>(*base_state);
+      if (att > 0) st->setToRandomPositions(jmg);
+      found_ik = st->setFromIK(jmg, target_world, ik_timeout, cb_fn, ik_opts, ik_cost_fn);
+      if (found_ik) st->copyJointGroupPositions(jmg, solution);
     }
+    rec.ik_time_sec = durationSec(t_ik_start, std::chrono::steady_clock::now());
 
     if (!found_ik) {
-      RCLCPP_ERROR(get_logger(),
-        "[%s] setFromIK failed after %d attempts — ABORT",
-        step_name.c_str(), max_ik_retries);
+      RCLCPP_ERROR(get_logger(), "[%s] IK failed — ABORT", step_name.c_str());
+      rec.message = "IK failed";
+      rec.total_compute_sec = durationSec(t_total_start, std::chrono::steady_clock::now());
+      if (csv_logger_) csv_logger_->write(rec);
       return false;
     }
-    RCLCPP_INFO(get_logger(),
-      "[%s] IK found — L2 cost: %.4f",
-      step_name.c_str(), computeL2Norm(solution, seed_state));
+    RCLCPP_INFO(get_logger(), "[%s] IK OK (%.3fs, L2=%.4f)",
+      step_name.c_str(), rec.ik_time_sec, computeL2Norm(solution, seed_state));
 
-    // ── 6. IK 해 → RRTConnect 계획 ────────────────────────────
-    move_group_->setJointValueTarget(solution);
+    // ── 5. RRT 계획 (rrt_only / rrt_trajopt) ──────────────────
     MoveGroupIface::Plan plan;
-    const auto plan_result = move_group_->plan(plan);
-    if (!plan_result) {
-      RCLCPP_ERROR(get_logger(),
-        "[%s] RRTConnect planning FAILED (code=%d)",
-        step_name.c_str(), plan_result.val);
-      return false;
-    }
-    RCLCPP_INFO(get_logger(),
-      "[%s] Plan OK (%.3f s, %zu pts)",
-      step_name.c_str(),
-      plan.planning_time_,
-      plan.trajectory_.joint_trajectory.points.size());
+    if (mode != "trajopt_only") {
+      move_group_->setJointValueTarget(solution);
+      auto t_rrt = std::chrono::steady_clock::now();
+      const auto plan_res = move_group_->plan(plan);
+      rec.rrt_planning_sec = durationSec(t_rrt, std::chrono::steady_clock::now());
+      rec.num_rrt_points   = static_cast<int>(
+                               plan.trajectory_.joint_trajectory.points.size());
 
-    // ── 7. RRT 궤적 publish (기록용 — rrt_path_recorder_node) ──
-    auto pub_traj = plan.trajectory_;
-    pub_traj.joint_trajectory.header.frame_id = step_name;
-    pub_traj.joint_trajectory.header.stamp    = this->now();
-    rrt_traj_pub_->publish(pub_traj);
-
-    // ── 8. FK → EE 경로 publish ──────────────────────────────
-    publishEePath(plan, step_name);
-
-    // ── 9. 실행: TrajOpt or MoveIt2 execute ──────────────────
-    const bool use_trajopt = get_parameter("use_trajopt").as_bool();
-    if (use_trajopt) {
-      // q_start: seed_state (IK 기준 현재 위치)
-      // q_end:   solution  (IK 해)
-      const bool trajopt_ok = runWithTrajopt(plan, seed_state, solution, step_name);
-      if (trajopt_ok) {
-        return true;
+      if (!plan_res) {
+        RCLCPP_ERROR(get_logger(), "[%s] RRTConnect FAILED", step_name.c_str());
+        rec.message = "RRT planning failed";
+        rec.total_compute_sec = durationSec(t_total_start, std::chrono::steady_clock::now());
+        if (csv_logger_) csv_logger_->write(rec);
+        return false;
       }
-      RCLCPP_WARN(get_logger(),
-        "[%s] TrajOpt 실패 — MoveIt2 execute 로 폴백", step_name.c_str());
+      RCLCPP_INFO(get_logger(), "[%s] RRT OK (%.3fs, %d pts)",
+        step_name.c_str(), rec.rrt_planning_sec, rec.num_rrt_points);
+
+      // 기록용 토픽 발행
+      auto pub_traj = plan.trajectory_;
+      pub_traj.joint_trajectory.header.frame_id = step_name;
+      pub_traj.joint_trajectory.header.stamp    = this->now();
+      rrt_traj_pub_->publish(pub_traj);
+      publishEePath(plan, step_name);
     }
 
-    // ── 10. MoveIt2 execute (기본 또는 폴백) ─────────────────
-    const auto exec_result = move_group_->execute(plan);
-    if (!exec_result) {
-      RCLCPP_ERROR(get_logger(),
-        "[%s] Execution FAILED (code=%d)", step_name.c_str(), exec_result.val);
-      return false;
+    // ── 6. 실행 분기 ──────────────────────────────────────────
+    bool exec_ok = false;
+
+    if (mode == "rrt_only") {
+      // ── 기준선: MoveIt2 execute ──
+      auto t_exec = std::chrono::steady_clock::now();
+      const auto er = move_group_->execute(plan);
+      rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
+      exec_ok = static_cast<bool>(er);
+      if (exec_ok) {
+        rec.traj = computeTrajectoryMetrics(plan.trajectory_.joint_trajectory);
+        rec.num_opt_points = rec.num_rrt_points;
+        rec.solver_status  = "rrt_only";
+      } else {
+        RCLCPP_ERROR(get_logger(), "[%s] MoveIt2 execute FAILED", step_name.c_str());
+        rec.message = "execute failed";
+      }
+
+    } else if (mode == "trajopt_only") {
+      // ── TrajOpt only (no RRT waypoints) ──
+      rec.num_rrt_points = 0;
+      exec_ok = runWithTrajopt(
+        plan, /*use_rrt_waypoints=*/false,
+        seed_state, solution, step_name, rec);
+      if (!exec_ok) rec.message = "trajopt_only failed";
+
+    } else {
+      // ── rrt_trajopt (기본) ──
+      exec_ok = runWithTrajopt(
+        plan, /*use_rrt_waypoints=*/true,
+        seed_state, solution, step_name, rec);
+      if (!exec_ok) {
+        rec.fallback_used = true;
+        RCLCPP_WARN(get_logger(), "[%s] TrajOpt 실패 → MoveIt2 폴백", step_name.c_str());
+        auto t_exec = std::chrono::steady_clock::now();
+        const auto er = move_group_->execute(plan);
+        rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
+        exec_ok = static_cast<bool>(er);
+        if (exec_ok) {
+          rec.traj = computeTrajectoryMetrics(plan.trajectory_.joint_trajectory);
+          rec.num_opt_points = rec.num_rrt_points;
+          rec.solver_status  = "fallback";
+        } else {
+          rec.message = "fallback execute failed";
+        }
+      }
     }
-    RCLCPP_INFO(get_logger(), "[%s] Done", step_name.c_str());
-    return true;
+
+    rec.success          = exec_ok;
+    rec.total_compute_sec = durationSec(t_total_start, std::chrono::steady_clock::now());
+    if (csv_logger_) csv_logger_->write(rec);
+
+    RCLCPP_INFO(get_logger(), "[%s] Done — mode=%s success=%s (%.2fs)",
+      step_name.c_str(), mode.c_str(), exec_ok ? "true" : "false",
+      rec.total_compute_sec);
+    return exec_ok;
   }
 
   // ── FK → /ee_path/planned publish ───────────────────────────
@@ -853,6 +1151,8 @@ private:
   rclcpp::CallbackGroup::SharedPtr trajopt_cbg_;
 
   std::mutex exec_mutex_;
+  int trial_id_ = 0;
+  std::shared_ptr<CsvLogger> csv_logger_;
 };
 
 // ================================================================

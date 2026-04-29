@@ -91,6 +91,16 @@ pick_place_node:
     # 실행 완료 여유 시간 [s] (T_opt + 이 값만큼 대기 후 다음 스텝 진행)
     traj_exec_margin_sec: 1.5
 
+    # ── Experiment comparison framework ──────────────────────────────
+    # experiment_mode 선택:
+    #   "rrt_only"     : MoveIt2 RRTConnect 실행만
+    #   "trajopt_only" : TrajOpt (Hermite 초기 추정, RRT 경로 없음)
+    #   "rrt_trajopt"  : RRT → TrajOpt (현재 파이프라인, 기본값)
+    experiment_mode: "rrt_trajopt"
+
+    # 실험 CSV 저장 경로 (비어있으면 ~/.ros/pick_place_exp/TIMESTAMP_results.csv)
+    experiment_csv_path: ""
+
 
 goal_relay_node:
   ros__parameters:

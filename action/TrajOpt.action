@@ -32,8 +32,21 @@ bool use_free_t             # true → optimise T_f (strongly recommended)
 bool success
 string message
 trajectory_msgs/JointTrajectory optimized_trajectory   # controller-ready
-float64 t_opt              # actual optimised trajectory time [s]
-float64 cost                # objective J value
+float64 t_opt                    # actual optimised trajectory time [s]
+float64 cost                     # objective J value
+# server-side timing breakdown
+int32   num_input_waypoints      # K received from client (0 = trajopt_only)
+int32   num_shortcut_waypoints   # K' after shortcutting
+float64 shortcut_time_sec
+float64 initial_guess_time_sec
+float64 solve_time_sec
+float64 total_server_time_sec
+# quality metrics (NaN if not available)
+float64 max_constraint_violation
+float64 mean_torque              # mean |τ| across CGL nodes [N·m]
+float64 max_torque               # max  |τ| [N·m]
+float64 mean_torque_rate         # mean |Δτ/Δt| [N·m/s]
+float64 max_torque_rate          # max  |Δτ/Δt| [N·m/s]
 ---
 # ── Feedback ───────────────────────────────────────────────────────────────
 string status

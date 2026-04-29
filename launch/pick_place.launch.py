@@ -62,6 +62,16 @@ def generate_launch_description():
             default_value="true",
             description="motion_logger_node 활성화 여부 (EE 이동 거리 + 관절 이동량 기록)",
         ),
+        DeclareLaunchArgument(
+            "experiment_mode",
+            default_value="rrt_trajopt",
+            description="실험 모드: rrt_only / trajopt_only / rrt_trajopt",
+        ),
+        DeclareLaunchArgument(
+            "experiment_csv_path",
+            default_value="",
+            description="실험 결과 CSV 저장 경로",
+        ),
 
         # --------------------------------------------------------
         # pick_place_node
@@ -80,7 +90,11 @@ def generate_launch_description():
             parameters=[
                 config,
                 kinematics,
-                {"use_sim_time": use_sim_time},
+                {
+                    "use_sim_time": use_sim_time,
+                    "experiment_mode": LaunchConfiguration("experiment_mode"),
+                    "experiment_csv_path": LaunchConfiguration("experiment_csv_path"),
+                }
             ],
         ),
 
