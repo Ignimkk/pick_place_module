@@ -1,26 +1,36 @@
 /**
  * pick_place_node.cpp
  *
- * ── Pick 시퀀스 ────────────────────────────────────────────────────
- *   Step 1: 그리퍼 열기
- *   Step 2: pre-grasp 이동  (pick_pose + Z offset) ← setFromIK + RRTConnect
- *   Step 3: grasp 직선 접근 (pick_pose)            ← Cartesian
- *   Step 4: 그리퍼 닫기
- *   Step 5: 직선 후퇴       (pre-grasp 복귀)       ← Cartesian
+ * ── Pick 시퀀스 (Cartesian 의존성 제거) ───────────────────────────
+ *   Step 1: grasp IK 검증              ← computeIKForPose(grasp, seed=current)
+ *   Step 2: pre_grasp IK 검증          ← computeIKForPose(pre_grasp, seed=grasp)
+ *   Step 3: 그리퍼 열기
+ *   Step 4: pre_grasp 이동             ← planAndExecuteToJoints (RRT/TrajOpt)
+ *   Step 5: grasp 접근                  ← approach_strategy:
+ *                                          "vertical_cartesian" (default):
+ *                                            x/y/orientation 고정, z 만 단조
+ *                                            감소하는 N 개 Cartesian waypoint
+ *                                          "joint": planAndExecuteToJoints (RRT/TrajOpt)
+ *                                          "cartesian": 단일 computeCartesianPath
+ *   Step 6: 그리퍼 닫기
+ *   Step 7: 후퇴 (best-effort)         ← approach_strategy 와 동일 (역방향):
+ *                                          "vertical_cartesian": z 단조 증가
  *
  * ── Place 시퀀스 ───────────────────────────────────────────────────
- *   Step 1: pre-place 이동  (place_pose + Z offset) ← setFromIK + RRTConnect
- *   Step 2: place 직선 접근 (place_pose)            ← Cartesian
- *   Step 3: 그리퍼 열기
- *   Step 4: 직선 후퇴       (pre-place 복귀)        ← Cartesian (best-effort)
+ *   동일 구조: place IK → pre_place IK(seed=place) → pre_place plan/exec
+ *              → approach (joint/cartesian) → release →
+ *              retreat (joint/cartesian, best-effort)
  *
- * ── 모션 계획 전략 ─────────────────────────────────────────────────
- *   pre-grasp / pre-place (장거리):
- *     setFromIK(pick_ik global, L2 비용 함수) → setJointValueTarget → RRTConnect
- *     → [옵션] trajopt_server_node 로 trajectory optimization
- *     - fallback 없음: 최대 3회 재시도(2회차~는 랜덤 시드), 모두 실패 시 ABORT
- *   grasp / place 접근·후퇴 (단거리 직선):
- *     computeCartesianPath → execute
+ * ── 핵심 설계 ──────────────────────────────────────────────────────
+ *   - 최종 grasp pose 의 IK 를 가장 먼저 검증한다.
+ *   - pre_grasp IK 는 grasp solution 을 seed 로 사용 → 같은 IK 분기 보존
+ *     (검색 시작 상태 + L2 비용 함수 모두 seed 기준)
+ *   - pre_grasp → grasp 접근에서 computeCartesianPath 실패 의존 제거.
+ *     기본 "joint" 모드는 grasp_solution 으로 RRT/TrajOpt plan 을 실행,
+ *     충돌 인지 plan 으로 실패 가능성을 줄인다.
+ *   - 실패 라벨 분리: grasp IK / pre_grasp IK / pre_grasp planning /
+ *                    pre_grasp execution / approach planning /
+ *                    approach execution.
  *
  * ── Trajectory Optimization 통합 (use_trajopt=true) ───────────────
  *   use_trajopt=false (기본): 기존 MoveIt2 execute 동작 유지
@@ -44,6 +54,8 @@
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/robot_state/robot_state.h>
 #include <moveit/kinematics_base/kinematics_base.h>
+#include <moveit/planning_scene_monitor/planning_scene_monitor.h>
+#include <moveit/collision_detection/collision_common.h>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -56,6 +68,7 @@
 #include <pick_place_module/action/traj_opt.hpp>
 
 #include <Eigen/Dense>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -63,6 +76,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -95,6 +109,28 @@ static const std::vector<std::string> UR_JOINT_NAMES = {
   "wrist_3_joint",
 };
 
+// MoveIt JointModelGroup 변수 순서 → UR 컨트롤러 순서(UR_JOINT_NAMES)로 재정렬.
+//
+// MoveIt의 copyJointGroupPositions()는 jmg->getVariableNames() 순서(알파벳 등)로
+// 반환하므로, UR 하드웨어 순서와 다를 수 있다.
+// trajopt_only 모드에서 q_start / q_end 를 TrajOpt 서버에 보내기 전에 반드시 사용.
+static std::vector<double> reorderToUrOrder(
+  const std::vector<double>           & q_moveit,
+  const moveit::core::JointModelGroup * jmg)
+{
+  const auto & var_names = jmg->getVariableNames();
+  std::vector<double> q_ur(UR_JOINT_NAMES.size(), 0.0);
+  for (size_t j = 0; j < UR_JOINT_NAMES.size(); ++j) {
+    for (size_t k = 0; k < var_names.size(); ++k) {
+      if (var_names[k] == UR_JOINT_NAMES[j] && k < q_moveit.size()) {
+        q_ur[j] = q_moveit[k];
+        break;
+      }
+    }
+  }
+  return q_ur;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 실험 프레임워크 — 구조체 및 헬퍼
 // ─────────────────────────────────────────────────────────────────────────
@@ -104,6 +140,23 @@ static double durationSec(
   const std::chrono::steady_clock::time_point & b)
 {
   return std::chrono::duration<double>(b - a).count();
+}
+
+static std::string trimCopy(const std::string & s)
+{
+  size_t first = 0;
+  while (first < s.size() &&
+         std::isspace(static_cast<unsigned char>(s[first])))
+  {
+    ++first;
+  }
+  size_t last = s.size();
+  while (last > first &&
+         std::isspace(static_cast<unsigned char>(s[last - 1])))
+  {
+    --last;
+  }
+  return s.substr(first, last - first);
 }
 
 struct TrajectoryMetrics {
@@ -338,7 +391,9 @@ public:
     declare_parameter<double>("grasp_orientation_z",  0.0);
     declare_parameter<double>("grasp_orientation_w",  0.0);
     declare_parameter<double>("ik_timeout",           0.5);
-    declare_parameter<double>("ik_cost_weight_l2",    0.0002);
+    declare_parameter<double>("ik_cost_weight_l2",    0.05);
+    declare_parameter<bool>("return_home_after_place", true);
+    declare_parameter<std::string>("initial_positions_path", INITIAL_POSITIONS_FILE);
 
     // ── TrajOpt 통합 파라미터 ────────────────────────────────────
     declare_parameter<bool>  ("use_trajopt",               false);
@@ -356,6 +411,24 @@ public:
     declare_parameter<std::string>("experiment_mode", "rrt_trajopt");
     // CSV 저장 경로 (비워두면 ~/.ros/pick_place_exp/TIMESTAMP_results.csv)
     declare_parameter<std::string>("experiment_csv_path", "");
+
+    // ── pre_grasp → grasp 접근 전략 ───────────────────────────
+    // "joint"              : grasp IK 로 관절 plan(RRT/TrajOpt) 실행
+    //                         (충돌 인지, 그러나 EE 경로가 수직 보장 안 됨)
+    // "cartesian"          : computeCartesianPath 단일 waypoint (레거시)
+    // "vertical_cartesian" : pre_pose ↔ final_pose 사이를 N 개 Cartesian
+    //                         waypoint 로 분할, x/y/orientation 고정,
+    //                         z 만 단조 변화 → 수직 강하/후퇴 보장 (기본)
+    declare_parameter<std::string>("approach_strategy", "vertical_cartesian");
+    // vertical_cartesian 분할 waypoint 수 (5–20 권장)
+    declare_parameter<int>("vertical_cartesian_waypoints", 10);
+
+    // ── 강하 경로(pre_pose → final_pose) 충돌 검증 파라미터 ─────
+    // 보간 단계 수: 10–20 이 권장 (높을수록 정확하지만 비용 증가)
+    declare_parameter<int>("descent_check_steps",        15);
+    // pre_pose IK 재시도 최대 횟수 (각 시도마다 다른 seed/random restart)
+    // 너무 크면 응답 지연, 작으면 회피 실패. 3–5 권장.
+    declare_parameter<int>("descent_max_ik_retries",     4);
 
     // ── MoveGroupInterface 초기화 ────────────────────────────────
     const std::string arm = get_parameter("arm_group").as_string();
@@ -441,19 +514,117 @@ public:
     csv_logger_ = std::make_shared<CsvLogger>(csv_path);
     RCLCPP_INFO(get_logger(), "Experiment CSV      : %s", csv_path.c_str());
 
+    // ── PlanningSceneMonitor (충돌 검사용) ──────────────────────
+    // move_group_node 가 robot_description 을 보유하므로 이를 재사용한다.
+    // monitored_planning_scene 토픽을 구독하여 move_group 이 갖는 동일한
+    // 충돌 정보(self-collision matrix, world geometry) 를 공유한다.
+    psm_ = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(
+      move_group_node, "robot_description");
+    if (psm_->getPlanningScene()) {
+      psm_->startSceneMonitor("/monitored_planning_scene");
+      psm_->startWorldGeometryMonitor();
+      psm_->startStateMonitor("/joint_states");
+      psm_->requestPlanningSceneState("/get_planning_scene");
+      RCLCPP_INFO(get_logger(),
+        "PlanningSceneMonitor active — descent collision checks enabled "
+        "(check_steps=%ld, max_retries=%ld)",
+        get_parameter("descent_check_steps").as_int(),
+        get_parameter("descent_max_ik_retries").as_int());
+    } else {
+      psm_.reset();
+      RCLCPP_WARN(get_logger(),
+        "PlanningSceneMonitor failed to initialize — descent collision "
+        "checks DISABLED (will use single IK without validation)");
+    }
+
     RCLCPP_INFO(get_logger(), "PickPlaceNode ready  |  /pick  /place");
   }
 
 private:
-  // ── orientation 강제 ──────────────────────────────────────────
+  // ── 현재 EE yaw 에 가장 가까운 하향 orientation 적용 ─────────────
+  //
+  // 입력 pose 의 position 은 유지한다. orientation 은 현재 엔드이펙터의
+  // 수평 방향을 최대한 보존하되, tool Z 축은 base_link 기준 -Z 방향으로
+  // 향하게 만든다. 현재 상태를 읽지 못하면 기존 고정 quaternion 파라미터로
+  // 폴백한다.
   geometry_msgs::msg::Pose applyDownwardOrientation(
     const geometry_msgs::msg::Pose & input) const
   {
     geometry_msgs::msg::Pose out = input;
-    out.orientation.x = get_parameter("grasp_orientation_x").as_double();
-    out.orientation.y = get_parameter("grasp_orientation_y").as_double();
-    out.orientation.z = get_parameter("grasp_orientation_z").as_double();
-    out.orientation.w = get_parameter("grasp_orientation_w").as_double();
+
+    auto apply_fixed_fallback = [&]() {
+      out.orientation.x = get_parameter("grasp_orientation_x").as_double();
+      out.orientation.y = get_parameter("grasp_orientation_y").as_double();
+      out.orientation.z = get_parameter("grasp_orientation_z").as_double();
+      out.orientation.w = get_parameter("grasp_orientation_w").as_double();
+    };
+
+    auto rs = move_group_->getCurrentState(2.0);
+    if (!rs) {
+      RCLCPP_WARN(get_logger(),
+        "getCurrentState failed while computing downward orientation — using fixed fallback");
+      apply_fixed_fallback();
+      return out;
+    }
+
+    const std::string ee_link = move_group_->getEndEffectorLink();
+    if (ee_link.empty()) {
+      RCLCPP_WARN(get_logger(),
+        "End effector link is empty — using fixed downward orientation fallback");
+      apply_fixed_fallback();
+      return out;
+    }
+
+    const Eigen::Isometry3d world_T_base =
+      rs->getGlobalLinkTransform("base_link");
+    const Eigen::Isometry3d world_T_ee =
+      rs->getGlobalLinkTransform(ee_link);
+    const Eigen::Matrix3d base_R_ee =
+      world_T_base.linear().transpose() * world_T_ee.linear();
+
+    const Eigen::Vector3d z_axis(0.0, 0.0, -1.0);
+    Eigen::Vector3d x_axis(base_R_ee(0, 0), base_R_ee(1, 0), 0.0);
+    Eigen::Vector3d y_axis;
+    const char * ref_axis = "tool_x";
+
+    if (x_axis.norm() > 1e-6) {
+      x_axis.normalize();
+      y_axis = z_axis.cross(x_axis);
+      y_axis.normalize();
+    } else {
+      y_axis = Eigen::Vector3d(base_R_ee(0, 1), base_R_ee(1, 1), 0.0);
+      if (y_axis.norm() <= 1e-6) {
+        RCLCPP_WARN(get_logger(),
+          "Current EE horizontal axes are degenerate — using fixed downward orientation fallback");
+        apply_fixed_fallback();
+        return out;
+      }
+      ref_axis = "tool_y";
+      y_axis.normalize();
+      x_axis = y_axis.cross(z_axis);
+      x_axis.normalize();
+    }
+
+    Eigen::Matrix3d base_R_target;
+    base_R_target.col(0) = x_axis;
+    base_R_target.col(1) = y_axis;
+    base_R_target.col(2) = z_axis;
+
+    Eigen::Quaterniond q(base_R_target);
+    q.normalize();
+    out.orientation.w = q.w();
+    out.orientation.x = q.x();
+    out.orientation.y = q.y();
+    out.orientation.z = q.z();
+
+    const double yaw_like_deg =
+      std::atan2(x_axis.y(), x_axis.x()) * 180.0 / 3.14159265358979323846;
+    RCLCPP_INFO(get_logger(),
+      "Downward orientation from current EE %s projection: x_axis_yaw=%.1f deg, "
+      "q=(x=%.4f, y=%.4f, z=%.4f, w=%.4f)",
+      ref_axis, yaw_like_deg,
+      out.orientation.x, out.orientation.y,
+      out.orientation.z, out.orientation.w);
     return out;
   }
 
@@ -496,14 +667,83 @@ private:
     motion_log_pub_->publish(msg);
   }
 
-  // ── TrajOpt Action client ─────────────────────────────────────
+  bool loadInitialJointTarget(std::vector<double> & joint_target)
+  {
+    const std::string path = get_parameter("initial_positions_path").as_string();
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+      RCLCPP_ERROR(get_logger(),
+        "Failed to open initial_positions.yaml: %s", path.c_str());
+      return false;
+    }
+
+    std::map<std::string, double> values;
+    std::string line;
+    int line_no = 0;
+    while (std::getline(ifs, line)) {
+      ++line_no;
+      const size_t comment_pos = line.find('#');
+      if (comment_pos != std::string::npos) {
+        line = line.substr(0, comment_pos);
+      }
+      line = trimCopy(line);
+      if (line.empty()) continue;
+
+      const size_t colon_pos = line.find(':');
+      if (colon_pos == std::string::npos) {
+        RCLCPP_WARN(get_logger(),
+          "Skipping malformed initial_positions line %d: %s",
+          line_no, line.c_str());
+        continue;
+      }
+
+      const std::string name = trimCopy(line.substr(0, colon_pos));
+      const std::string value_text = trimCopy(line.substr(colon_pos + 1));
+      if (name.empty() || value_text.empty()) {
+        RCLCPP_WARN(get_logger(),
+          "Skipping incomplete initial_positions line %d: %s",
+          line_no, line.c_str());
+        continue;
+      }
+
+      try {
+        values[name] = std::stod(value_text);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(get_logger(),
+          "Invalid joint value in %s line %d (%s: %s): %s",
+          path.c_str(), line_no, name.c_str(), value_text.c_str(), e.what());
+        return false;
+      }
+    }
+
+    joint_target.clear();
+    joint_target.reserve(UR_JOINT_NAMES.size());
+    for (const auto & joint_name : UR_JOINT_NAMES) {
+      const auto it = values.find(joint_name);
+      if (it == values.end()) {
+        RCLCPP_ERROR(get_logger(),
+          "initial_positions.yaml missing required joint: %s",
+          joint_name.c_str());
+        return false;
+      }
+      joint_target.push_back(it->second);
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "Loaded initial joint target from %s", path.c_str());
+    return true;
+  }
+
+  // ── TrajOpt Action client (rrt_trajopt 전용) ────────────────────
   //
-  // use_rrt_waypoints=true : RRT plan 의 waypoint 를 TrajOpt goal 에 패킹
-  // use_rrt_waypoints=false: K=0 전송 → 서버가 Cubic Hermite 초기 추정 사용
-  //                           (trajopt_only 모드)
+  // use_rrt_waypoints=true : RRT plan 의 waypoint 를 TrajOpt goal 에 패킹.
+  //                          rrt_trajopt 모드에서만 호출됨.
+  //
+  // trajopt_only 모드는 runTrajoptOnly() 를 사용한다.
+  // 이 함수에서 use_rrt_waypoints=false 경로는 사용되지 않는다.
   //
   // 성공 시 rec 에 서버 메트릭을 기록하고 optimized_trajectory 를 발행 후
-  // T_opt + traj_exec_margin_sec 대기. 실패 시 false 반환.
+  // T_opt + traj_exec_margin_sec 대기. 실패 시 false 반환 (caller 가 RRT 폴백).
   bool runWithTrajopt(
     const MoveGroupIface::Plan & plan,
     bool                         use_rrt_waypoints,
@@ -530,7 +770,8 @@ private:
     }
 
     // ── joint 순서 인덱스 맵 (UR 순서 기준) ────────────────────
-    // trajopt_only(K=0) 에서도 q_start/q_end 재정렬에 사용
+    // RRT plan 의 joint_names 에서 UR 순서 인덱스를 구성한다.
+    // rrt_trajopt 에서 호출되므로 jt.joint_names 는 항상 비어 있지 않다.
     const auto & jt = plan.trajectory_.joint_trajectory;
     std::vector<int> joint_idx(6, -1);
     if (!jt.joint_names.empty()) {
@@ -543,7 +784,7 @@ private:
         }
       }
     } else {
-      // q_start_joints 가 이미 UR 순서라고 가정 (trajopt_only)
+      // 안전 폴백: RRT plan 에 joint_names 없을 경우 identity 매핑
       for (int j = 0; j < 6; ++j) joint_idx[j] = j;
     }
 
@@ -578,11 +819,11 @@ private:
         }
       }
     } else {
-      // trajopt_only: K=0 → 서버가 Cubic Hermite 초기 추정 사용
+      // 비정상: use_rrt_waypoints=false 는 이 함수에서 사용하지 않음
       trajopt_goal.num_waypoints = 0;
     }
 
-    // q_start / q_end (UR 순서로 재정렬)
+    // q_start / q_end (RRT plan 의 joint_names 기반 UR 순서로 재정렬)
     trajopt_goal.q_start.resize(6, 0.0);
     trajopt_goal.q_end.resize(6, 0.0);
     for (int j = 0; j < 6; ++j) {
@@ -596,9 +837,8 @@ private:
     }
 
     RCLCPP_INFO(get_logger(),
-      "[%s] TrajOpt goal 전송 — K=%d (%s), t_init=%.2fs, N=%d",
+      "[%s][rrt_trajopt] TrajOpt goal 전송 — K=%d, t_init=%.2fs, N=%d",
       step_name.c_str(), trajopt_goal.num_waypoints,
-      use_rrt_waypoints ? "rrt_trajopt" : "trajopt_only",
       t_init, N_cheb);
 
     // ── Goal 전송 + 결과 대기 ────────────────────────────────────
@@ -709,56 +949,193 @@ private:
     return true;
   }
 
-  // ── IK + experiment_mode 분기 실행 ──────────────────────────
+  // ── trajopt_only 전용: RRT 없이 q_start/q_end → TrajOpt 서버 직송 ──
   //
-  // experiment_mode:
-  //   "rrt_only"    → IK → RRTConnect → MoveIt2 execute
-  //   "trajopt_only"→ IK → TrajOpt (K=0, Hermite 초기 추정)
-  //   "rrt_trajopt" → IK → RRTConnect → TrajOpt → publish
-  //                   (TrajOpt 실패 시 MoveIt2 폴백)
-  //
-  // 결과는 rec 에 기록 후 csv_logger_ 에 씀.
-  bool planAndExecuteWithIK(const geometry_msgs::msg::Pose & target,
-                             const std::string & step_name)
+  // q_start_ur, q_end_ur: reorderToUrOrder() 로 UR 컨트롤러 순서가 보장된 벡터.
+  // num_waypoints=0 → 서버가 Cubic Hermite 초기 추정을 사용 (K=0 경로).
+  // runWithTrajopt 와 달리 MoveGroupIface::Plan 에 의존하지 않는다.
+  bool runTrajoptOnly(
+    const std::vector<double> & q_start_ur,
+    const std::vector<double> & q_end_ur,
+    const std::string          & step_name,
+    ExperimentRecord           & rec)
   {
-    const std::string mode = get_parameter("experiment_mode").as_string();
-    ExperimentRecord rec;
-    rec.trial_id        = ++trial_id_;
-    rec.step_name       = step_name;
-    rec.experiment_mode = mode;
+    const double server_timeout = get_parameter("trajopt_server_timeout_sec").as_double();
+    const double t_init         = get_parameter("t_init_sec").as_double();
+    const int    N_cheb         = get_parameter("trajopt_N").as_int();
+    const double exec_margin    = get_parameter("traj_exec_margin_sec").as_double();
+    const bool   use_reduced    = get_parameter("trajopt_use_reduced").as_bool();
+    const bool   use_free_t     = get_parameter("trajopt_use_free_t").as_bool();
 
-    auto t_total_start = std::chrono::steady_clock::now();
-
-    // ── 1. 현재 로봇 상태 취득 ────────────────────────────────
-    auto robot_state = move_group_->getCurrentState(2.0);
-    if (!robot_state) {
-      RCLCPP_ERROR(get_logger(), "[%s] Failed to get current robot state", step_name.c_str());
-      rec.message = "get_current_state failed";
-      if (csv_logger_) csv_logger_->write(rec);
+    // ── 서버 연결 확인 ─────────────────────────────────────────────
+    if (!trajopt_client_->wait_for_action_server(
+          std::chrono::duration<double>(server_timeout)))
+    {
+      rec.message = "TrajOpt server not available";
+      RCLCPP_ERROR(get_logger(),
+        "[%s][trajopt_only] TrajOpt 서버 연결 실패 (timeout=%.1fs) — 중단",
+        step_name.c_str(), server_timeout);
       return false;
     }
-    const auto * jmg = robot_state->getJointModelGroup(
-      get_parameter("arm_group").as_string());
 
-    std::vector<double> seed_state;
-    robot_state->copyJointGroupPositions(jmg, seed_state);
+    // ── Goal 구성 (K=0, Hermite 초기 추정) ─────────────────────────
+    TrajOpt::Goal trajopt_goal;
+    trajopt_goal.t_init        = t_init;
+    trajopt_goal.cheb_degree   = static_cast<int32_t>(N_cheb);
+    trajopt_goal.use_reduced   = use_reduced;
+    trajopt_goal.use_free_t    = use_free_t;
+    trajopt_goal.num_waypoints = 0;  // RRT 경로 없음
 
-    // ── 2. IK 옵션 ─────────────────────────────────────────────
-    kinematics::KinematicsQueryOptions ik_opts;
-    ik_opts.return_approximate_solution = true;
-    const double ik_timeout = get_parameter("ik_timeout").as_double();
-    const double w_l2       = get_parameter("ik_cost_weight_l2").as_double();
+    trajopt_goal.q_start.assign(q_start_ur.begin(), q_start_ur.end());
+    trajopt_goal.q_end.assign(q_end_ur.begin(), q_end_ur.end());
 
-    // ── 3. base_link → world 변환 ──────────────────────────────
+    RCLCPP_INFO(get_logger(),
+      "[%s][trajopt_only] TrajOpt goal 전송 — K=0 (Hermite), t_init=%.2fs, N=%d",
+      step_name.c_str(), t_init, N_cheb);
+
+    // ── Goal 전송 + 결과 대기 ──────────────────────────────────────
+    auto promise_result = std::make_shared<
+      std::promise<rclcpp_action::ClientGoalHandle<TrajOpt>::WrappedResult>>();
+    auto future_result = promise_result->get_future();
+    auto promise_goal  = std::make_shared<std::promise<bool>>();
+    auto future_goal   = promise_goal->get_future();
+
+    auto opts = rclcpp_action::Client<TrajOpt>::SendGoalOptions{};
+    opts.goal_response_callback =
+      [this, &step_name, promise_goal](
+        const rclcpp_action::ClientGoalHandle<TrajOpt>::SharedPtr & gh)
+      {
+        if (!gh) {
+          RCLCPP_ERROR(get_logger(),
+            "[%s][trajopt_only] TrajOpt goal 거부", step_name.c_str());
+          promise_goal->set_value(false);
+        } else {
+          RCLCPP_INFO(get_logger(),
+            "[%s][trajopt_only] TrajOpt goal 수락", step_name.c_str());
+          promise_goal->set_value(true);
+        }
+      };
+    opts.feedback_callback =
+      [this, &step_name](
+        rclcpp_action::ClientGoalHandle<TrajOpt>::SharedPtr,
+        const std::shared_ptr<const TrajOpt::Feedback> fb)
+      {
+        RCLCPP_INFO(get_logger(),
+          "[%s][trajopt_only] [%5.1f%%] %s (%.1fs)",
+          step_name.c_str(), fb->progress * 100.0f,
+          fb->status.c_str(), fb->elapsed_sec);
+      };
+    opts.result_callback =
+      [promise_result](
+        const rclcpp_action::ClientGoalHandle<TrajOpt>::WrappedResult & res)
+      {
+        promise_result->set_value(res);
+      };
+
+    trajopt_client_->async_send_goal(trajopt_goal, opts);
+
+    // goal 수락 대기 (최대 5s)
+    if (future_goal.wait_for(std::chrono::seconds(5)) != std::future_status::ready
+        || !future_goal.get())
+    {
+      rec.message = "TrajOpt goal rejected or timeout";
+      RCLCPP_ERROR(get_logger(),
+        "[%s][trajopt_only] TrajOpt goal 수락 실패 — 중단", step_name.c_str());
+      return false;
+    }
+
+    // 결과 대기 (최대 T_init*3 + 5s)
+    const double result_timeout = t_init * 3.0 + 5.0;
+    if (future_result.wait_for(std::chrono::duration<double>(result_timeout))
+        != std::future_status::ready)
+    {
+      rec.message = "TrajOpt result timeout";
+      RCLCPP_ERROR(get_logger(),
+        "[%s][trajopt_only] TrajOpt result 타임아웃 (%.1fs) — 중단",
+        step_name.c_str(), result_timeout);
+      return false;
+    }
+
+    auto wrapped = future_result.get();
+    if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED) {
+      rec.message = "TrajOpt action failed";
+      RCLCPP_ERROR(get_logger(),
+        "[%s][trajopt_only] TrajOpt Action FAILED (code=%d) — 중단",
+        step_name.c_str(), static_cast<int>(wrapped.code));
+      return false;
+    }
+
+    const auto & res = wrapped.result;
+    if (!res->success) {
+      RCLCPP_WARN(get_logger(),
+        "[%s][trajopt_only] TrajOpt NLP 미수렴: %s — 현재 추정치로 계속 진행",
+        step_name.c_str(), res->message.c_str());
+    }
+
+    // ── 서버 메트릭 기록 ────────────────────────────────────────────
+    rec.shortcut_time_sec  = res->shortcut_time_sec;
+    rec.guess_time_sec     = res->initial_guess_time_sec;
+    rec.solve_time_sec     = res->solve_time_sec;
+    rec.num_shortcut_pts   = res->num_shortcut_waypoints;
+    rec.num_opt_points     = static_cast<int>(res->optimized_trajectory.points.size());
+    rec.final_cost         = res->cost;
+    rec.max_constr_viol    = res->max_constraint_violation;
+    rec.mean_torque        = res->mean_torque;
+    rec.max_torque         = res->max_torque;
+    rec.mean_torque_rate   = res->mean_torque_rate;
+    rec.max_torque_rate    = res->max_torque_rate;
+    rec.solver_status      = res->success ? "converged" : "partial";
+    rec.traj               = computeTrajectoryMetrics(res->optimized_trajectory);
+
+    RCLCPP_INFO(get_logger(),
+      "[%s][trajopt_only] TrajOpt — t_opt=%.3fs, J=%.4f, τ_max=%.1fNm, opt=%d pts",
+      step_name.c_str(), res->t_opt, res->cost, res->max_torque, rec.num_opt_points);
+
+    // ── 최적화 궤적 발행 + 실행 대기 ────────────────────────────────
+    auto t_exec = std::chrono::steady_clock::now();
+    traj_pub_->publish(res->optimized_trajectory);
+    rclcpp::sleep_for(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(res->t_opt + exec_margin)));
+    rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
+
+    RCLCPP_INFO(get_logger(),
+      "[%s][trajopt_only] 실행 완료 (%.2fs 대기)", step_name.c_str(), rec.exec_wait_sec);
+    return true;
+  }
+
+  // ── IK 헬퍼 ───────────────────────────────────────────────────
+  //
+  // target_in_base : 입력 pose (base_link 기준)
+  // seed_state     : (1) IK 검색 시작 상태, (2) L2 비용 함수 기준
+  //                  → 같은 IK 분기로 수렴하도록 유도
+  // max_attempts   : 내부 재시도 횟수 (1차는 seed, 2차+는 random restart)
+  // 반환: 성공 여부. solution / ik_time_sec 채움.
+  bool computeIKForPose(
+    const geometry_msgs::msg::Pose   & target_in_base,
+    const std::vector<double>        & seed_state,
+    std::vector<double>              & solution,
+    double                           & ik_time_sec,
+    const std::string                & label,
+    int                                max_attempts = 3)
+  {
+    auto rs = move_group_->getCurrentState(2.0);
+    if (!rs) {
+      RCLCPP_ERROR(get_logger(), "[%s] getCurrentState failed", label.c_str());
+      return false;
+    }
+    const auto * jmg = rs->getJointModelGroup(get_parameter("arm_group").as_string());
+
+    // base_link → world 변환
     const Eigen::Isometry3d world_T_base =
-      robot_state->getGlobalLinkTransform("base_link");
-    Eigen::Isometry3d target_in_base = Eigen::Isometry3d::Identity();
-    target_in_base.translation() = Eigen::Vector3d(
-      target.position.x, target.position.y, target.position.z);
-    target_in_base.linear() = Eigen::Quaterniond(
-      target.orientation.w, target.orientation.x,
-      target.orientation.y, target.orientation.z).toRotationMatrix();
-    const Eigen::Isometry3d target_in_world = world_T_base * target_in_base;
+      rs->getGlobalLinkTransform("base_link");
+    Eigen::Isometry3d target_in_base_eig = Eigen::Isometry3d::Identity();
+    target_in_base_eig.translation() = Eigen::Vector3d(
+      target_in_base.position.x, target_in_base.position.y, target_in_base.position.z);
+    target_in_base_eig.linear() = Eigen::Quaterniond(
+      target_in_base.orientation.w, target_in_base.orientation.x,
+      target_in_base.orientation.y, target_in_base.orientation.z).toRotationMatrix();
+    const Eigen::Isometry3d target_in_world = world_T_base * target_in_base_eig;
 
     geometry_msgs::msg::Pose target_world;
     target_world.position.x = target_in_world.translation().x();
@@ -770,13 +1147,14 @@ private:
     target_world.orientation.y = q_world.y();
     target_world.orientation.z = q_world.z();
 
-    RCLCPP_INFO(get_logger(),
-      "[%s][%s] target world(%.3f, %.3f, %.3f)",
-      step_name.c_str(), mode.c_str(),
-      target_world.position.x, target_world.position.y, target_world.position.z);
+    kinematics::KinematicsQueryOptions ik_opts;
+    // 기존 동작 호환: KDL 이 exact 수렴에 실패해도 근사해를 받아들임
+    // (그렇지 않으면 ik_timeout 동안 수렴 못 한 모든 케이스가 ABORT 로 빠짐)
+    ik_opts.return_approximate_solution = true;
+    const double ik_timeout = get_parameter("ik_timeout").as_double();
+    const double w_l2       = get_parameter("ik_cost_weight_l2").as_double();
 
-    // ── 4. IK ──────────────────────────────────────────────────
-    const auto ik_cost_fn =
+    const auto cost_fn =
       [w_l2, seed_state](
         const geometry_msgs::msg::Pose &,
         const moveit::core::RobotState & sol_state,
@@ -787,90 +1165,358 @@ private:
       sol_state.copyJointGroupPositions(jmg_arg, prop);
       return w_l2 * computeL2Norm(prop, seed_state);
     };
-
     moveit::core::GroupStateValidityCallbackFn cb_fn;
-    bool                found_ik = false;
-    std::vector<double> solution;
-    auto base_state = move_group_->getCurrentState(2.0);
 
-    auto t_ik_start = std::chrono::steady_clock::now();
-    for (int att = 0; att < 3 && !found_ik; ++att) {
-      auto st = std::make_shared<moveit::core::RobotState>(*base_state);
-      if (att > 0) st->setToRandomPositions(jmg);
-      found_ik = st->setFromIK(jmg, target_world, ik_timeout, cb_fn, ik_opts, ik_cost_fn);
-      if (found_ik) st->copyJointGroupPositions(jmg, solution);
+    bool found = false;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int att = 0; att < max_attempts && !found; ++att) {
+      auto st = std::make_shared<moveit::core::RobotState>(*rs);
+      if (att == 0) {
+        // 1차: seed_state 부터 검색 시작 → 같은 IK 분기 선호
+        st->setJointGroupPositions(jmg, seed_state);
+      } else {
+        st->setToRandomPositions(jmg);
+      }
+      found = st->setFromIK(jmg, target_world, ik_timeout, cb_fn, ik_opts, cost_fn);
+      if (found) st->copyJointGroupPositions(jmg, solution);
     }
-    rec.ik_time_sec = durationSec(t_ik_start, std::chrono::steady_clock::now());
+    ik_time_sec = durationSec(t0, std::chrono::steady_clock::now());
 
-    if (!found_ik) {
-      RCLCPP_ERROR(get_logger(), "[%s] IK failed — ABORT", step_name.c_str());
-      rec.message = "IK failed";
-      rec.total_compute_sec = durationSec(t_total_start, std::chrono::steady_clock::now());
-      if (csv_logger_) csv_logger_->write(rec);
+    if (!found) {
+      RCLCPP_ERROR(get_logger(), "[%s] IK FAILED (%.3fs)", label.c_str(), ik_time_sec);
       return false;
     }
-    RCLCPP_INFO(get_logger(), "[%s] IK OK (%.3fs, L2=%.4f)",
-      step_name.c_str(), rec.ik_time_sec, computeL2Norm(solution, seed_state));
+    RCLCPP_INFO(get_logger(),
+      "[%s] IK OK (%.3fs, target world=(%.3f,%.3f,%.3f), L2=%.4f vs seed)",
+      label.c_str(), ik_time_sec,
+      target_world.position.x, target_world.position.y, target_world.position.z,
+      computeL2Norm(solution, seed_state));
+    return true;
+  }
 
-    // ── 5. RRT 계획 (rrt_only / rrt_trajopt) ──────────────────
-    MoveGroupIface::Plan plan;
-    if (mode != "trajopt_only") {
-      move_group_->setJointValueTarget(solution);
-      auto t_rrt = std::chrono::steady_clock::now();
-      const auto plan_res = move_group_->plan(plan);
-      rec.rrt_planning_sec = durationSec(t_rrt, std::chrono::steady_clock::now());
-      rec.num_rrt_points   = static_cast<int>(
-                               plan.trajectory_.joint_trajectory.points.size());
+  // ── 충돌 검사 헬퍼 ────────────────────────────────────────────
+  //
+  // joints 를 적용한 상태가 PlanningScene 기준 충돌(self + world)인지 반환.
+  // PSM 미초기화 시: false 반환 (검사 비활성, IK 차단하지 않음).
+  bool inCollision(const std::vector<double> & joints,
+                   const std::string         & arm_group_name)
+  {
+    if (!psm_) return false;
+    planning_scene_monitor::LockedPlanningSceneRO ps(psm_);
+    if (!ps) return false;
 
-      if (!plan_res) {
-        RCLCPP_ERROR(get_logger(), "[%s] RRTConnect FAILED", step_name.c_str());
-        rec.message = "RRT planning failed";
-        rec.total_compute_sec = durationSec(t_total_start, std::chrono::steady_clock::now());
-        if (csv_logger_) csv_logger_->write(rec);
+    moveit::core::RobotState state = ps->getCurrentState();
+    const auto * jmg = state.getJointModelGroup(arm_group_name);
+    if (!jmg) return false;
+    state.setJointGroupPositions(jmg, joints);
+    state.update();
+
+    collision_detection::CollisionRequest req;
+    req.group_name = arm_group_name;
+    req.contacts   = false;     // 빠른 응답 (접촉 정보 미수집)
+    collision_detection::CollisionResult res;
+    ps->checkCollision(req, res, state);
+    return res.collision;
+  }
+
+  // ── 강하 경로 충돌 검증 ───────────────────────────────────────
+  //
+  // start ↔ end 사이를 joint-space 에서 균등 보간하여 각 단계마다
+  // 충돌 여부를 확인. 한 곳이라도 충돌 시 false 반환.
+  // n_steps = 0 이면 검사를 스킵.
+  bool validateJointSpaceDescent(
+    const std::vector<double> & start,
+    const std::vector<double> & end,
+    int                          n_steps,
+    const std::string          & label)
+  {
+    if (!psm_)        return true;     // PSM 없음 → 검사 불가, 통과 처리
+    if (n_steps <= 0) return true;
+    if (start.size() != end.size() || start.empty()) return false;
+
+    const std::string arm_group_name = get_parameter("arm_group").as_string();
+
+    for (int k = 0; k <= n_steps; ++k) {
+      const double alpha = static_cast<double>(k) / n_steps;
+      std::vector<double> q(start.size());
+      for (size_t j = 0; j < start.size(); ++j) {
+        q[j] = (1.0 - alpha) * start[j] + alpha * end[j];
+      }
+      if (inCollision(q, arm_group_name)) {
+        const char * loc =
+          (k == 0)        ? "START (candidate IK itself)" :
+          (k == n_steps)  ? "END (anchor IK itself)" :
+                            "intermediate";
+        RCLCPP_WARN(get_logger(),
+          "[%s] descent COLLISION at step %d/%d (alpha=%.2f, %s) — IK rejected",
+          label.c_str(), k, n_steps, alpha, loc);
         return false;
       }
-      RCLCPP_INFO(get_logger(), "[%s] RRT OK (%.3fs, %d pts)",
-        step_name.c_str(), rec.rrt_planning_sec, rec.num_rrt_points);
+    }
+    RCLCPP_INFO(get_logger(),
+      "[%s] descent path OK (%d intermediate states checked)",
+      label.c_str(), n_steps + 1);
+    return true;
+  }
 
-      // 기록용 토픽 발행
-      auto pub_traj = plan.trajectory_;
-      pub_traj.joint_trajectory.header.frame_id = step_name;
-      pub_traj.joint_trajectory.header.stamp    = this->now();
-      rrt_traj_pub_->publish(pub_traj);
-      publishEePath(plan, step_name);
+  // ── 충돌-free IK (anchor 용) ───────────────────────────────────
+  //
+  // grasp_pose / place_pose 같은 "최종 목표 pose" 의 IK 를 구하면서,
+  // 그 IK 자체가 self/world 충돌 상태인지 검증. 충돌이면 random seed
+  // 로 재시도. computeIKForPose 만으로는 IK 수렴 여부만 보고 충돌은
+  // 보지 못하므로, 콜리딩 분기를 그대로 grasp/place 실행에 넘기게
+  // 되어 pre-approach 단계에서 무한 실패하는 문제를 막는다.
+  //
+  //   try 0          : seed_state 그대로 (현재 상태 우선)
+  //   try 1 ~ N-1    : random restart (다른 분기 탐색)
+  //
+  // PSM 미초기화 시 첫 IK 결과를 그대로 채택 (검사 비활성).
+  bool computeCollisionFreeIK(
+    const geometry_msgs::msg::Pose   & target_in_base,
+    const std::vector<double>        & seed_state,
+    int                                max_attempts,
+    std::vector<double>              & solution,
+    double                           & ik_time_sec_total,
+    const std::string                & label)
+  {
+    ik_time_sec_total = 0.0;
+
+    auto rs = move_group_->getCurrentState(2.0);
+    if (!rs) {
+      RCLCPP_ERROR(get_logger(), "[%s] getCurrentState failed", label.c_str());
+      return false;
+    }
+    const std::string arm_group_name = get_parameter("arm_group").as_string();
+    const auto * jmg = rs->getJointModelGroup(arm_group_name);
+
+    for (int outer = 0; outer < max_attempts; ++outer) {
+      std::vector<double> seed = seed_state;
+      if (outer > 0) {
+        auto st = std::make_shared<moveit::core::RobotState>(*rs);
+        st->setToRandomPositions(jmg);
+        st->copyJointGroupPositions(jmg, seed);
+      }
+
+      const std::string sub_label =
+        label + "[try" + std::to_string(outer) + "]";
+
+      std::vector<double> candidate;
+      double dt = 0.0;
+      const bool ik_ok = computeIKForPose(
+        target_in_base, seed, candidate, dt, sub_label, /*max_attempts=*/1);
+      ik_time_sec_total += dt;
+      if (!ik_ok) continue;
+
+      // IK 자체가 충돌이면 거부
+      if (psm_ && inCollision(candidate, arm_group_name)) {
+        RCLCPP_WARN(get_logger(),
+          "[%s] IK solution is in COLLISION — rejecting, retry with new seed",
+          sub_label.c_str());
+        continue;
+      }
+
+      solution = candidate;
+      RCLCPP_INFO(get_logger(),
+        "[%s] collision-free IK at attempt %d (IK time %.3fs)",
+        label.c_str(), outer, ik_time_sec_total);
+      return true;
     }
 
-    // ── 6. 실행 분기 ──────────────────────────────────────────
+    RCLCPP_ERROR(get_logger(),
+      "[%s] no collision-free IK after %d attempts (IK time %.3fs)",
+      label.c_str(), max_attempts, ik_time_sec_total);
+    return false;
+  }
+
+  // ── 충돌-free pre-approach IK 탐색 ────────────────────────────
+  //
+  // pre_pose 의 IK 를 여러 번 시도하면서 anchor_solution 까지의
+  // 강하 경로가 충돌하지 않는 해를 찾는다.
+  //
+  //   try 0          : seed = anchor_solution (같은 IK 분기 우선)
+  //   try 1 ~ N-1    : random restart (다른 분기 탐색)
+  //
+  // 각 candidate 마다 validateJointSpaceDescent 로 강하 경로 검증.
+  // 통과 시 즉시 반환. RRT plan 검증은 호출하지 않음 — 본 단계에서는
+  // 빠른 self/world 충돌 검사로 후보를 거른 뒤, 실제 plan 은 다음
+  // planAndExecuteToJoints 단계에서 수행한다.
+  //
+  // 반환: 첫 번째로 통과한 IK 가 pre_solution 에 채워짐.
+  //       모든 attempt 실패 시 false.
+  bool findCollisionFreePreApproachIK(
+    const geometry_msgs::msg::Pose   & pre_pose,
+    const std::vector<double>        & anchor_solution,
+    int                                max_outer_attempts,
+    int                                n_descent_steps,
+    std::vector<double>              & pre_solution,
+    double                           & ik_time_sec_total,
+    const std::string                & label)
+  {
+    ik_time_sec_total = 0.0;
+
+    auto rs = move_group_->getCurrentState(2.0);
+    if (!rs) {
+      RCLCPP_ERROR(get_logger(), "[%s] getCurrentState failed", label.c_str());
+      return false;
+    }
+    const std::string arm_group_name = get_parameter("arm_group").as_string();
+    const auto * jmg = rs->getJointModelGroup(arm_group_name);
+
+    // Anchor 자체 충돌 여부 사전 점검 (defensive — anchor 가 콜리딩이면
+    // 모든 pre-approach 후보가 step N (alpha=1.0) 에서 실패하므로 무의미)
+    if (psm_ && inCollision(anchor_solution, arm_group_name)) {
+      RCLCPP_ERROR(get_logger(),
+        "[%s] anchor solution is in COLLISION — cannot find valid pre-approach. "
+        "Likely cause: grasp/place IK landed on a colliding branch.",
+        label.c_str());
+      return false;
+    }
+
+    for (int outer = 0; outer < max_outer_attempts; ++outer) {
+      // outer 0: anchor_solution 에서 출발 (같은 분기 선호)
+      // outer 1+: 무작위 seed (다른 분기 탐색)
+      std::vector<double> seed = anchor_solution;
+      if (outer > 0) {
+        auto st = std::make_shared<moveit::core::RobotState>(*rs);
+        st->setToRandomPositions(jmg);
+        st->copyJointGroupPositions(jmg, seed);
+      }
+
+      const std::string sub_label =
+        label + "[try" + std::to_string(outer) + "]";
+
+      // bio_ik 1회만 호출 (max_attempts=1) → 외부 outer loop 가
+      // random restart 를 통제. 총 IK 호출 수 = max_outer_attempts.
+      std::vector<double> candidate;
+      double dt = 0.0;
+      const bool ik_ok = computeIKForPose(
+        pre_pose, seed, candidate, dt, sub_label, /*max_attempts=*/1);
+      ik_time_sec_total += dt;
+
+      if (!ik_ok) continue;
+
+      // 강하 경로 충돌 검증
+      if (validateJointSpaceDescent(candidate, anchor_solution,
+                                     n_descent_steps, sub_label))
+      {
+        pre_solution = candidate;
+        RCLCPP_INFO(get_logger(),
+          "[%s] valid IK + collision-free descent at attempt %d "
+          "(IK time %.3fs, L2 vs anchor=%.4f)",
+          label.c_str(), outer, ik_time_sec_total,
+          computeL2Norm(candidate, anchor_solution));
+        return true;
+      }
+    }
+
+    RCLCPP_ERROR(get_logger(),
+      "[%s] no collision-free IK found after %d attempts (IK time %.3fs)",
+      label.c_str(), max_outer_attempts, ik_time_sec_total);
+    return false;
+  }
+
+  // ── joint_target 으로 plan + execute (experiment_mode 분기) ────
+  //
+  // 사전에 IK 로 얻은 joint 해를 그대로 사용한다 (IK 재실행 없음).
+  //
+  // experiment_mode:
+  //   "trajopt_only" → IK q_start/q_end 를 UR 순서로 재정렬 → runTrajoptOnly()
+  //                    RRT 완전 미사용. move_group_->plan() 호출 없음.
+  //   "rrt_only"     → setJointValueTarget → RRTConnect → execute
+  //   "rrt_trajopt"  → RRTConnect → TrajOpt → publish
+  //                    (TrajOpt 실패 시 MoveIt2 폴백)
+  //
+  // 결과는 rec 에 누적 (caller 가 IK time / total compute time 등 추가 후 CSV 기록).
+  bool planAndExecuteToJoints(
+    const std::vector<double> & joint_target,
+    const std::string         & step_name,
+    ExperimentRecord          & rec)
+  {
+    const std::string mode = get_parameter("experiment_mode").as_string();
+    rec.experiment_mode = mode;
+
+    // 현재 robot state 취득
+    auto rs = move_group_->getCurrentState(2.0);
+    if (!rs) {
+      rec.message = "get_current_state failed";
+      RCLCPP_ERROR(get_logger(), "[%s] %s", step_name.c_str(), rec.message.c_str());
+      return false;
+    }
+    const auto * jmg = rs->getJointModelGroup(get_parameter("arm_group").as_string());
+
+    // ── trajopt_only: RRT 없이 IK 결과를 직접 TrajOpt 서버로 전송 ──────────
+    // MoveIt 내부 변수 순서(jmg->getVariableNames())와 UR 하드웨어 순서가
+    // 다를 수 있으므로 reorderToUrOrder() 로 joint 이름 기반 명시적 재정렬.
+    // move_group_->setJointValueTarget(), plan() 모두 호출하지 않음.
+    if (mode == "trajopt_only") {
+      rec.num_rrt_points = 0;
+
+      std::vector<double> q_moveit_start;
+      rs->copyJointGroupPositions(jmg, q_moveit_start);
+
+      const std::vector<double> q_start_ur = reorderToUrOrder(q_moveit_start, jmg);
+      const std::vector<double> q_end_ur   = reorderToUrOrder(joint_target,   jmg);
+
+      RCLCPP_INFO(get_logger(),
+        "[%s][trajopt_only] q_start/q_end → UR 순서 재정렬 완료, TrajOpt 서버로 전송",
+        step_name.c_str());
+
+      const bool exec_ok = runTrajoptOnly(q_start_ur, q_end_ur, step_name, rec);
+      if (!exec_ok && rec.message.empty())
+        rec.message = "execution failed (trajopt_only)";
+      rec.success = exec_ok;
+      return exec_ok;
+    }
+
+    // ── RRT 계획 (rrt_only / rrt_trajopt) ──────────────────────────────────
+    std::vector<double> q_start_moveit;
+    rs->copyJointGroupPositions(jmg, q_start_moveit);
+
+    MoveGroupIface::Plan plan;
+    move_group_->setJointValueTarget(joint_target);
+    auto t_rrt = std::chrono::steady_clock::now();
+    const auto plan_res = move_group_->plan(plan);
+    rec.rrt_planning_sec = durationSec(t_rrt, std::chrono::steady_clock::now());
+    rec.num_rrt_points   = static_cast<int>(
+                             plan.trajectory_.joint_trajectory.points.size());
+
+    if (!plan_res) {
+      rec.message = "planning failed (RRTConnect)";
+      RCLCPP_ERROR(get_logger(), "[%s] RRTConnect FAILED (%.3fs)",
+        step_name.c_str(), rec.rrt_planning_sec);
+      return false;
+    }
+    RCLCPP_INFO(get_logger(), "[%s] RRT OK (%.3fs, %d pts)",
+      step_name.c_str(), rec.rrt_planning_sec, rec.num_rrt_points);
+
+    auto pub_traj = plan.trajectory_;
+    pub_traj.joint_trajectory.header.frame_id = step_name;
+    pub_traj.joint_trajectory.header.stamp    = this->now();
+    rrt_traj_pub_->publish(pub_traj);
+    publishEePath(plan, step_name);
+
+    // ── 실행 분기 ──
     bool exec_ok = false;
 
     if (mode == "rrt_only") {
-      // ── 기준선: MoveIt2 execute ──
       auto t_exec = std::chrono::steady_clock::now();
       const auto er = move_group_->execute(plan);
       rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
       exec_ok = static_cast<bool>(er);
       if (exec_ok) {
-        rec.traj = computeTrajectoryMetrics(plan.trajectory_.joint_trajectory);
+        rec.traj           = computeTrajectoryMetrics(plan.trajectory_.joint_trajectory);
         rec.num_opt_points = rec.num_rrt_points;
         rec.solver_status  = "rrt_only";
       } else {
-        RCLCPP_ERROR(get_logger(), "[%s] MoveIt2 execute FAILED", step_name.c_str());
-        rec.message = "execute failed";
+        rec.message = "execution failed (MoveIt2 execute)";
+        RCLCPP_ERROR(get_logger(), "[%s] %s", step_name.c_str(), rec.message.c_str());
       }
 
-    } else if (mode == "trajopt_only") {
-      // ── TrajOpt only (no RRT waypoints) ──
-      rec.num_rrt_points = 0;
-      exec_ok = runWithTrajopt(
-        plan, /*use_rrt_waypoints=*/false,
-        seed_state, solution, step_name, rec);
-      if (!exec_ok) rec.message = "trajopt_only failed";
-
     } else {
-      // ── rrt_trajopt (기본) ──
+      // rrt_trajopt: RRT 경로를 TrajOpt 초기 추정으로 사용
       exec_ok = runWithTrajopt(
         plan, /*use_rrt_waypoints=*/true,
-        seed_state, solution, step_name, rec);
+        q_start_moveit, joint_target, step_name, rec);
       if (!exec_ok) {
         rec.fallback_used = true;
         RCLCPP_WARN(get_logger(), "[%s] TrajOpt 실패 → MoveIt2 폴백", step_name.c_str());
@@ -879,22 +1525,17 @@ private:
         rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
         exec_ok = static_cast<bool>(er);
         if (exec_ok) {
-          rec.traj = computeTrajectoryMetrics(plan.trajectory_.joint_trajectory);
+          rec.traj           = computeTrajectoryMetrics(plan.trajectory_.joint_trajectory);
           rec.num_opt_points = rec.num_rrt_points;
           rec.solver_status  = "fallback";
         } else {
-          rec.message = "fallback execute failed";
+          rec.message = "execution failed (fallback execute)";
+          RCLCPP_ERROR(get_logger(), "[%s] %s", step_name.c_str(), rec.message.c_str());
         }
       }
     }
 
-    rec.success          = exec_ok;
-    rec.total_compute_sec = durationSec(t_total_start, std::chrono::steady_clock::now());
-    if (csv_logger_) csv_logger_->write(rec);
-
-    RCLCPP_INFO(get_logger(), "[%s] Done — mode=%s success=%s (%.2fs)",
-      step_name.c_str(), mode.c_str(), exec_ok ? "true" : "false",
-      rec.total_compute_sec);
+    rec.success = exec_ok;
     return exec_ok;
   }
 
@@ -980,19 +1621,113 @@ private:
     return true;
   }
 
+  // ── 수직 Cartesian 강하/후퇴 ──────────────────────────────────
+  //
+  // start_pose ↔ end_pose 사이를 z 축 방향으로만 보간하며 N 개의
+  // Cartesian waypoint 를 생성, computeCartesianPath 로 실행한다.
+  //   - x, y, orientation 은 end_pose 값으로 고정 (start.x/y 가 다르면 경고)
+  //   - z 는 (start_z → end_z) 균등 보간 (단조 감소 또는 증가)
+  //
+  // 의도:
+  //   pre_grasp → grasp / pre_place → place 강하 동안 EE 경로가
+  //   joint planning 으로 인해 휘거나 기울어지지 않도록 Cartesian
+  //   수직 경로를 강제. 후퇴는 같은 함수에 start/end 만 swap.
+  //
+  // 반환: false 시 cartesian_min_fraction 미달 또는 execute 실패.
+  bool verticalCartesianMove(
+    const geometry_msgs::msg::Pose & start_pose,
+    const geometry_msgs::msg::Pose & end_pose,
+    int                              n_waypoints,
+    const std::string              & step_name)
+  {
+    if (n_waypoints < 1) n_waypoints = 1;
+
+    const double eef_step     = get_parameter("cartesian_eef_step").as_double();
+    const double min_fraction = get_parameter("cartesian_min_fraction").as_double();
+
+    // x, y, orientation 일관성 점검 (수직 강하의 전제)
+    const double dx = std::abs(start_pose.position.x - end_pose.position.x);
+    const double dy = std::abs(start_pose.position.y - end_pose.position.y);
+    if (dx > 1e-3 || dy > 1e-3) {
+      RCLCPP_WARN(get_logger(),
+        "[%s] vertical_cartesian: start/end x,y mismatch "
+        "(dx=%.4fm, dy=%.4fm) — using end pose x,y for waypoints",
+        step_name.c_str(), dx, dy);
+    }
+
+    // waypoint 생성: alpha = k/N, k = 1..N
+    //   wp.x/y/orientation = end (고정)
+    //   wp.z = (1-alpha)*start_z + alpha*end_z
+    std::vector<geometry_msgs::msg::Pose> waypoints;
+    waypoints.reserve(n_waypoints);
+    for (int k = 1; k <= n_waypoints; ++k) {
+      const double alpha = static_cast<double>(k) / n_waypoints;
+      geometry_msgs::msg::Pose wp = end_pose;
+      wp.position.z = (1.0 - alpha) * start_pose.position.z
+                    +        alpha  * end_pose.position.z;
+      waypoints.push_back(wp);
+    }
+
+    moveit_msgs::msg::RobotTrajectory trajectory;
+    const double fraction = move_group_->computeCartesianPath(
+      waypoints, eef_step, /*jump_threshold=*/0.0, trajectory);
+
+    const double dz = std::abs(end_pose.position.z - start_pose.position.z);
+
+    if (fraction < min_fraction) {
+      RCLCPP_ERROR(get_logger(),
+        "[%s] vertical_cartesian path incomplete: %.1f%% "
+        "(required >= %.1f%%, %d waypoints, dz=%.4fm)",
+        step_name.c_str(), fraction * 100.0, min_fraction * 100.0,
+        n_waypoints, dz);
+      return false;
+    }
+    RCLCPP_INFO(get_logger(),
+      "[%s] vertical_cartesian path %.1f%% (%d waypoints → %zu pts, dz=%.4fm)",
+      step_name.c_str(), fraction * 100.0,
+      n_waypoints, trajectory.joint_trajectory.points.size(), dz);
+
+    const auto er = move_group_->execute(trajectory);
+    if (!er) {
+      RCLCPP_ERROR(get_logger(),
+        "[%s] vertical_cartesian execution FAILED (code=%d)",
+        step_name.c_str(), er.val);
+      return false;
+    }
+    RCLCPP_INFO(get_logger(), "[%s] Done", step_name.c_str());
+    return true;
+  }
+
   // ── Pick 실행 ────────────────────────────────────────────────
+  //
+  // 새 시퀀스 (Cartesian 의존성 제거):
+  //   1) grasp IK 검증 (실패 → "grasp IK failed")
+  //   2) pre_grasp IK 검증 — seed = grasp solution (같은 분기)
+  //                          (실패 → "pre_grasp IK failed")
+  //   3) gripper open
+  //   4) plan & execute → pre_grasp (실패 → "pre_grasp planning failed" /
+  //                                          "pre_grasp execution failed")
+  //   5) approach_strategy:
+  //      "joint"     → plan & execute → grasp (sees collision)
+  //                                          (실패 → "approach planning failed" /
+  //                                                  "approach execution failed")
+  //      "cartesian" → computeCartesianPath (레거시)
+  //                                          (실패 → "approach execution failed (cartesian)")
+  //   6) gripper close
+  //   7) retreat (Cartesian, best-effort)
   void executePick(const std::shared_ptr<PickGoalHandle> gh)
   {
     std::lock_guard<std::mutex> exec_lock(exec_mutex_);
     auto result = std::make_shared<Pick::Result>();
 
-    const double offset     = get_parameter("pre_grasp_offset").as_double();
-    const double grp_open   = get_parameter("gripper_open_pos").as_double();
-    const double grp_close  = get_parameter("gripper_close_pos").as_double();
-    const double max_effort = get_parameter("gripper_max_effort").as_double();
-    const double gripper_to = get_parameter("gripper_timeout_sec").as_double();
+    const double offset       = get_parameter("pre_grasp_offset").as_double();
+    const double grp_open     = get_parameter("gripper_open_pos").as_double();
+    const double grp_close    = get_parameter("gripper_close_pos").as_double();
+    const double max_effort   = get_parameter("gripper_max_effort").as_double();
+    const double gripper_to   = get_parameter("gripper_timeout_sec").as_double();
+    const std::string strat   = get_parameter("approach_strategy").as_string();
 
-    auto abort = [&](const std::string & msg) {
+    auto abort_with = [&](const std::string & msg) {
       RCLCPP_ERROR(get_logger(), "[pick] ABORT: %s", msg.c_str());
       result->success = false; result->message = msg;
       gh->abort(result);
@@ -1013,43 +1748,173 @@ private:
       RCLCPP_INFO(get_logger(), "[pick][%5.1f%%] %s", progress * 100.0f, status.c_str());
     };
 
-    const geometry_msgs::msg::Pose pick_pose =
+    const geometry_msgs::msg::Pose grasp_pose =
       applyDownwardOrientation(gh->get_goal()->pick_pose);
-    geometry_msgs::msg::Pose pre_grasp = pick_pose;
-    pre_grasp.position.z += offset;
+    geometry_msgs::msg::Pose pre_grasp_pose = grasp_pose;
+    pre_grasp_pose.position.z += offset;
 
-    fb("Step1: Opening gripper", 0.05f);
-    if (check_cancel()) { return; }
+    // ── 현재 상태(seed) 취득 ─────────────────────────────────
+    std::vector<double> current_state;
+    {
+      auto rs = move_group_->getCurrentState(2.0);
+      if (!rs) { abort_with("grasp IK failed: getCurrentState failed"); return; }
+      const auto * jmg = rs->getJointModelGroup(get_parameter("arm_group").as_string());
+      rs->copyJointGroupPositions(jmg, current_state);
+    }
+
+    // ── Step 1: grasp IK + 충돌 검증 ────────────────────────
+    // computeCollisionFreeIK: IK 자체가 self/world 충돌 분기에 떨어지면
+    // random restart 로 재시도. 콜리딩 anchor 가 그대로 pre_grasp 단계로
+    // 넘어가 모든 후보가 alpha=1.0 에서 실패하는 문제를 차단.
+    fb("Step1: Validating grasp IK", 0.05f);
+    if (check_cancel()) return;
+    std::vector<double> grasp_solution;
+    double ik_grasp_sec = 0.0;
+    const int n_retries_anchor =
+      static_cast<int>(get_parameter("descent_max_ik_retries").as_int());
+    if (!computeCollisionFreeIK(grasp_pose, current_state, n_retries_anchor,
+                                  grasp_solution, ik_grasp_sec, "grasp_IK"))
+    {
+      abort_with("grasp IK failed (no collision-free solution)");
+      return;
+    }
+
+    // ── Step 2: pre_grasp IK — seed = grasp solution + 강하 충돌 검증 ──
+    // pre_grasp → grasp 경로를 joint-space 보간으로 미리 검사하여
+    // self-collision 위험이 있는 IK 분기를 거부한다.
+    fb("Step2: Computing pre-grasp IK + validating descent", 0.10f);
+    if (check_cancel()) return;
+    std::vector<double> pre_grasp_solution;
+    double ik_pre_sec = 0.0;
+    const int n_steps_pick   = static_cast<int>(get_parameter("descent_check_steps").as_int());
+    const int n_retries_pick = static_cast<int>(get_parameter("descent_max_ik_retries").as_int());
+    if (!findCollisionFreePreApproachIK(
+          pre_grasp_pose, /*anchor=*/grasp_solution,
+          n_retries_pick, n_steps_pick,
+          pre_grasp_solution, ik_pre_sec, "pre_grasp_IK"))
+    {
+      abort_with("pre_grasp IK failed (no collision-free descent found)");
+      return;
+    }
+
+    // ── Step 3: gripper open ────────────────────────────────
+    fb("Step3: Opening gripper", 0.15f);
+    if (check_cancel()) return;
     if (!controlGripper(grp_open, max_effort, gripper_to)) {
-      abort("Failed to open gripper"); return;
+      abort_with("Failed to open gripper"); return;
     }
 
-    fb("Step2: Moving to pre-grasp (IK + RRTConnect [+ TrajOpt])", 0.20f);
-    if (check_cancel()) { return; }
+    // ── Step 4: plan + execute → pre_grasp ──────────────────
+    fb("Step4: Moving to pre-grasp (joint plan)", 0.30f);
+    if (check_cancel()) return;
     triggerMotionLog(true);
-    const bool pre_grasp_ok = planAndExecuteWithIK(pre_grasp, "pre_grasp");
+    ExperimentRecord pre_rec;
+    pre_rec.trial_id   = ++trial_id_;
+    pre_rec.step_name  = "pre_grasp";
+    pre_rec.ik_time_sec = ik_pre_sec;
+    auto t_pre = std::chrono::steady_clock::now();
+    const bool pre_ok = planAndExecuteToJoints(pre_grasp_solution, "pre_grasp", pre_rec);
+    pre_rec.total_compute_sec = durationSec(t_pre, std::chrono::steady_clock::now());
     triggerMotionLog(false);
-    if (!pre_grasp_ok) {
-      abort("Failed to reach pre-grasp pose"); return;
+    if (csv_logger_) csv_logger_->write(pre_rec);
+    if (!pre_ok) {
+      const bool was_planning = pre_rec.message.find("planning") != std::string::npos;
+      abort_with(was_planning ? "pre_grasp planning failed: " + pre_rec.message
+                              : "pre_grasp execution failed: " + pre_rec.message);
+      return;
     }
 
-    fb("Step3: Approaching grasp (Cartesian)", 0.45f);
-    if (check_cancel()) { return; }
-    if (!cartesianMove(pick_pose, "grasp_approach")) {
-      abort("Failed to approach grasp pose"); return;
+    // ── Step 5: approach pre_grasp → grasp ──────────────────
+    fb(std::string("Step5: Approaching grasp (") + strat + ")", 0.55f);
+    if (check_cancel()) return;
+    bool approach_ok = false;
+    if (strat == "vertical_cartesian") {
+      // 수직 강하: x/y/orientation 고정, z 만 단조 감소
+      const int n_wp = static_cast<int>(
+        get_parameter("vertical_cartesian_waypoints").as_int());
+      approach_ok = verticalCartesianMove(
+        pre_grasp_pose, grasp_pose, n_wp, "grasp_approach");
+      if (!approach_ok) {
+        abort_with("approach execution failed (vertical_cartesian path incomplete)");
+        return;
+      }
+    } else if (strat == "cartesian") {
+      // 레거시 직선 접근 — computeCartesianPath 단일 waypoint
+      approach_ok = cartesianMove(grasp_pose, "grasp_approach");
+      if (!approach_ok) {
+        abort_with("approach execution failed (cartesian path incomplete)");
+        return;
+      }
+    } else {
+      // "joint": 사전 계산한 grasp_solution 으로 충돌 인지 plan/execute
+      triggerMotionLog(true);
+      ExperimentRecord ap_rec;
+      ap_rec.trial_id   = ++trial_id_;
+      ap_rec.step_name  = "grasp_approach";
+      ap_rec.ik_time_sec = ik_grasp_sec;
+      auto t_ap = std::chrono::steady_clock::now();
+      approach_ok = planAndExecuteToJoints(grasp_solution, "grasp_approach", ap_rec);
+      ap_rec.total_compute_sec = durationSec(t_ap, std::chrono::steady_clock::now());
+      triggerMotionLog(false);
+      if (csv_logger_) csv_logger_->write(ap_rec);
+      if (!approach_ok) {
+        const bool was_planning = ap_rec.message.find("planning") != std::string::npos;
+        abort_with(was_planning ? "approach planning failed: " + ap_rec.message
+                                : "approach execution failed: " + ap_rec.message);
+        return;
+      }
     }
 
-    fb("Step4: Closing gripper", 0.65f);
-    if (check_cancel()) { return; }
+    // ── Step 6: gripper close ───────────────────────────────
+    fb("Step6: Closing gripper", 0.75f);
+    if (check_cancel()) return;
     if (!controlGripper(grp_close, max_effort, gripper_to)) {
-      abort("Failed to close gripper"); return;
+      abort_with("Failed to close gripper"); return;
     }
 
-    fb("Step5: Retreating to pre-grasp (Cartesian)", 0.85f);
+    // ── Step 7: retreat (best-effort, approach_strategy 동일 적용) ──
+    // "vertical_cartesian": grasp → pre_grasp 수직 후퇴 (z 만 증가, 기본)
+    // "joint":              pre_grasp_solution 으로 plan/exec
+    // "cartesian":          단일 Cartesian waypoint (레거시)
+    fb(std::string("Step7: Retreating (") + strat + ")", 0.90f);
     if (!check_cancel()) {
-      if (!cartesianMove(pre_grasp, "grasp_retreat")) {
-        RCLCPP_WARN(get_logger(),
-          "[pick] Retreat failed — object grasped, continuing");
+      bool retreat_ok = false;
+      if (strat == "vertical_cartesian") {
+        const int n_wp = static_cast<int>(
+          get_parameter("vertical_cartesian_waypoints").as_int());
+        retreat_ok = verticalCartesianMove(
+          grasp_pose, pre_grasp_pose, n_wp, "grasp_retreat");
+        if (!retreat_ok) {
+          RCLCPP_WARN(get_logger(),
+            "[pick] retreat execution failed (vertical_cartesian path incomplete) "
+            "— object grasped, continuing");
+        }
+      } else if (strat == "cartesian") {
+        retreat_ok = cartesianMove(pre_grasp_pose, "grasp_retreat");
+        if (!retreat_ok) {
+          RCLCPP_WARN(get_logger(),
+            "[pick] retreat execution failed (cartesian path incomplete) "
+            "— object grasped, continuing");
+        }
+      } else {
+        // "joint"
+        triggerMotionLog(true);
+        ExperimentRecord ret_rec;
+        ret_rec.trial_id    = ++trial_id_;
+        ret_rec.step_name   = "grasp_retreat";
+        ret_rec.ik_time_sec = ik_pre_sec;          // pre_grasp IK 재사용
+        auto t_ret = std::chrono::steady_clock::now();
+        retreat_ok = planAndExecuteToJoints(pre_grasp_solution, "grasp_retreat", ret_rec);
+        ret_rec.total_compute_sec = durationSec(t_ret, std::chrono::steady_clock::now());
+        triggerMotionLog(false);
+        if (csv_logger_) csv_logger_->write(ret_rec);
+        if (!retreat_ok) {
+          const bool was_planning = ret_rec.message.find("planning") != std::string::npos;
+          RCLCPP_WARN(get_logger(),
+            "[pick] retreat %s failed: %s — object grasped, continuing",
+            was_planning ? "planning" : "execution",
+            ret_rec.message.c_str());
+        }
       }
     }
 
@@ -1061,17 +1926,20 @@ private:
   }
 
   // ── Place 실행 ───────────────────────────────────────────────
+  // executePick 과 동일 구조. place IK → pre_place IK(seed=place) →
+  // pre_place plan/exec → approach (joint/cartesian) → release → retreat.
   void executePlace(const std::shared_ptr<PlaceGoalHandle> gh)
   {
     std::lock_guard<std::mutex> exec_lock(exec_mutex_);
     auto result = std::make_shared<Place::Result>();
 
-    const double offset     = get_parameter("pre_grasp_offset").as_double();
-    const double grp_open   = get_parameter("gripper_open_pos").as_double();
-    const double max_effort = get_parameter("gripper_max_effort").as_double();
-    const double gripper_to = get_parameter("gripper_timeout_sec").as_double();
+    const double offset       = get_parameter("pre_grasp_offset").as_double();
+    const double grp_open     = get_parameter("gripper_open_pos").as_double();
+    const double max_effort   = get_parameter("gripper_max_effort").as_double();
+    const double gripper_to   = get_parameter("gripper_timeout_sec").as_double();
+    const std::string strat   = get_parameter("approach_strategy").as_string();
 
-    auto abort = [&](const std::string & msg) {
+    auto abort_with = [&](const std::string & msg) {
       RCLCPP_ERROR(get_logger(), "[place] ABORT: %s", msg.c_str());
       result->success = false; result->message = msg;
       gh->abort(result);
@@ -1094,33 +1962,191 @@ private:
 
     const geometry_msgs::msg::Pose place_pose =
       applyDownwardOrientation(gh->get_goal()->place_pose);
-    geometry_msgs::msg::Pose pre_place = place_pose;
-    pre_place.position.z += offset;
+    geometry_msgs::msg::Pose pre_place_pose = place_pose;
+    pre_place_pose.position.z += offset;
 
-    fb("Step1: Moving to pre-place (IK + RRTConnect [+ TrajOpt])", 0.15f);
-    if (check_cancel()) { return; }
+    std::vector<double> current_state;
+    {
+      auto rs = move_group_->getCurrentState(2.0);
+      if (!rs) { abort_with("place IK failed: getCurrentState failed"); return; }
+      const auto * jmg = rs->getJointModelGroup(get_parameter("arm_group").as_string());
+      rs->copyJointGroupPositions(jmg, current_state);
+    }
+
+    // ── Step 1: place IK + 충돌 검증 ──
+    // computeCollisionFreeIK: IK 자체가 self/world 충돌 분기에 떨어지면
+    // random restart 로 재시도. 콜리딩 anchor 가 그대로 pre_place 단계로
+    // 넘어가 모든 후보가 alpha=1.0 에서 실패하는 문제를 차단.
+    fb("Step1: Validating place IK", 0.05f);
+    if (check_cancel()) return;
+    std::vector<double> place_solution;
+    double ik_place_sec = 0.0;
+    const int n_retries_anchor_place =
+      static_cast<int>(get_parameter("descent_max_ik_retries").as_int());
+    if (!computeCollisionFreeIK(place_pose, current_state, n_retries_anchor_place,
+                                  place_solution, ik_place_sec, "place_IK"))
+    {
+      abort_with("place IK failed (no collision-free solution)");
+      return;
+    }
+
+    // ── Step 2: pre_place IK — seed = place + 강하 충돌 검증 ──
+    // pre_place → place 경로를 joint-space 보간으로 미리 검사하여
+    // gripper ↔ upper_arm_link self-collision 같은 위험을 거부한다.
+    fb("Step2: Computing pre-place IK + validating descent", 0.10f);
+    if (check_cancel()) return;
+    std::vector<double> pre_place_solution;
+    double ik_pre_sec = 0.0;
+    const int n_steps_place   = static_cast<int>(get_parameter("descent_check_steps").as_int());
+    const int n_retries_place = static_cast<int>(get_parameter("descent_max_ik_retries").as_int());
+    if (!findCollisionFreePreApproachIK(
+          pre_place_pose, /*anchor=*/place_solution,
+          n_retries_place, n_steps_place,
+          pre_place_solution, ik_pre_sec, "pre_place_IK"))
+    {
+      abort_with("pre_place IK failed (no collision-free descent found)");
+      return;
+    }
+
+    // ── Step 3: plan + execute → pre_place ──
+    fb("Step3: Moving to pre-place (joint plan)", 0.25f);
+    if (check_cancel()) return;
     triggerMotionLog(true);
-    const bool pre_place_ok = planAndExecuteWithIK(pre_place, "pre_place");
+    ExperimentRecord pre_rec;
+    pre_rec.trial_id   = ++trial_id_;
+    pre_rec.step_name  = "pre_place";
+    pre_rec.ik_time_sec = ik_pre_sec;
+    auto t_pre = std::chrono::steady_clock::now();
+    const bool pre_ok = planAndExecuteToJoints(pre_place_solution, "pre_place", pre_rec);
+    pre_rec.total_compute_sec = durationSec(t_pre, std::chrono::steady_clock::now());
     triggerMotionLog(false);
-    if (!pre_place_ok) {
-      abort("Failed to reach pre-place pose"); return;
+    if (csv_logger_) csv_logger_->write(pre_rec);
+    if (!pre_ok) {
+      const bool was_planning = pre_rec.message.find("planning") != std::string::npos;
+      abort_with(was_planning ? "pre_place planning failed: " + pre_rec.message
+                              : "pre_place execution failed: " + pre_rec.message);
+      return;
     }
 
-    fb("Step2: Approaching place (Cartesian)", 0.40f);
-    if (check_cancel()) { return; }
-    if (!cartesianMove(place_pose, "place_approach")) {
-      abort("Failed to approach place pose"); return;
+    // ── Step 4: approach pre_place → place ──
+    fb(std::string("Step4: Approaching place (") + strat + ")", 0.50f);
+    if (check_cancel()) return;
+    bool approach_ok = false;
+    if (strat == "vertical_cartesian") {
+      // 수직 강하: x/y/orientation 고정, z 만 단조 감소
+      const int n_wp = static_cast<int>(
+        get_parameter("vertical_cartesian_waypoints").as_int());
+      approach_ok = verticalCartesianMove(
+        pre_place_pose, place_pose, n_wp, "place_approach");
+      if (!approach_ok) {
+        abort_with("approach execution failed (vertical_cartesian path incomplete)");
+        return;
+      }
+    } else if (strat == "cartesian") {
+      approach_ok = cartesianMove(place_pose, "place_approach");
+      if (!approach_ok) {
+        abort_with("approach execution failed (cartesian path incomplete)");
+        return;
+      }
+    } else {
+      // "joint"
+      triggerMotionLog(true);
+      ExperimentRecord ap_rec;
+      ap_rec.trial_id   = ++trial_id_;
+      ap_rec.step_name  = "place_approach";
+      ap_rec.ik_time_sec = ik_place_sec;
+      auto t_ap = std::chrono::steady_clock::now();
+      approach_ok = planAndExecuteToJoints(place_solution, "place_approach", ap_rec);
+      ap_rec.total_compute_sec = durationSec(t_ap, std::chrono::steady_clock::now());
+      triggerMotionLog(false);
+      if (csv_logger_) csv_logger_->write(ap_rec);
+      if (!approach_ok) {
+        const bool was_planning = ap_rec.message.find("planning") != std::string::npos;
+        abort_with(was_planning ? "approach planning failed: " + ap_rec.message
+                                : "approach execution failed: " + ap_rec.message);
+        return;
+      }
     }
 
-    fb("Step3: Releasing object", 0.70f);
-    if (check_cancel()) { return; }
+    // ── Step 5: release ──
+    fb("Step5: Releasing object", 0.75f);
+    if (check_cancel()) return;
     if (!controlGripper(grp_open, max_effort, gripper_to)) {
-      abort("Failed to open gripper at place"); return;
+      abort_with("Failed to open gripper at place"); return;
     }
 
-    fb("Step4: Retreating from place (Cartesian)", 0.90f);
+    // ── Step 6: retreat (best-effort, approach_strategy 동일 적용) ──
+    fb(std::string("Step6: Retreating (") + strat + ")", 0.90f);
     if (!check_cancel()) {
-      cartesianMove(pre_place, "place_retreat");
+      bool retreat_ok = false;
+      if (strat == "vertical_cartesian") {
+        const int n_wp = static_cast<int>(
+          get_parameter("vertical_cartesian_waypoints").as_int());
+        retreat_ok = verticalCartesianMove(
+          place_pose, pre_place_pose, n_wp, "place_retreat");
+        if (!retreat_ok) {
+          RCLCPP_WARN(get_logger(),
+            "[place] retreat execution failed (vertical_cartesian path incomplete) "
+            "— object released, continuing");
+        }
+      } else if (strat == "cartesian") {
+        retreat_ok = cartesianMove(pre_place_pose, "place_retreat");
+        if (!retreat_ok) {
+          RCLCPP_WARN(get_logger(),
+            "[place] retreat execution failed (cartesian path incomplete) "
+            "— object released, continuing");
+        }
+      } else {
+        // "joint"
+        triggerMotionLog(true);
+        ExperimentRecord ret_rec;
+        ret_rec.trial_id    = ++trial_id_;
+        ret_rec.step_name   = "place_retreat";
+        ret_rec.ik_time_sec = ik_pre_sec;          // pre_place IK 재사용
+        auto t_ret = std::chrono::steady_clock::now();
+        retreat_ok = planAndExecuteToJoints(pre_place_solution, "place_retreat", ret_rec);
+        ret_rec.total_compute_sec = durationSec(t_ret, std::chrono::steady_clock::now());
+        triggerMotionLog(false);
+        if (csv_logger_) csv_logger_->write(ret_rec);
+        if (!retreat_ok) {
+          const bool was_planning = ret_rec.message.find("planning") != std::string::npos;
+          RCLCPP_WARN(get_logger(),
+            "[place] retreat %s failed: %s — object released, continuing",
+            was_planning ? "planning" : "execution",
+            ret_rec.message.c_str());
+        }
+      }
+    }
+
+    if (get_parameter("return_home_after_place").as_bool()) {
+      fb("Step7: Returning to initial pose", 0.97f);
+      if (check_cancel()) return;
+
+      std::vector<double> home_joints;
+      if (!loadInitialJointTarget(home_joints)) {
+        abort_with("return home failed: cannot load initial_positions.yaml");
+        return;
+      }
+
+      triggerMotionLog(true);
+      ExperimentRecord home_rec;
+      home_rec.trial_id  = ++trial_id_;
+      home_rec.step_name = "return_home";
+      auto t_home = std::chrono::steady_clock::now();
+      const bool home_ok =
+        planAndExecuteToJoints(home_joints, "return_home", home_rec);
+      home_rec.total_compute_sec =
+        durationSec(t_home, std::chrono::steady_clock::now());
+      triggerMotionLog(false);
+      if (csv_logger_) csv_logger_->write(home_rec);
+
+      if (!home_ok) {
+        const bool was_planning =
+          home_rec.message.find("planning") != std::string::npos;
+        abort_with(was_planning ? "return home planning failed: " + home_rec.message
+                                : "return home execution failed: " + home_rec.message);
+        return;
+      }
     }
 
     fb("Place complete", 1.0f);
@@ -1153,6 +2179,10 @@ private:
   std::mutex exec_mutex_;
   int trial_id_ = 0;
   std::shared_ptr<CsvLogger> csv_logger_;
+
+  // PlanningSceneMonitor: 강하 경로 self/world 충돌 검사용.
+  // null 일 수 있음 → 검사 스킵 처리.
+  std::shared_ptr<planning_scene_monitor::PlanningSceneMonitor> psm_;
 };
 
 // ================================================================

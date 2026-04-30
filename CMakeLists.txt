@@ -16,6 +16,7 @@ set(CMAKE_CXX_STANDARD 17)
 # CMAKE_CURRENT_SOURCE_DIR = .../src/pick_place_module
 # ---------------------------------------------------------------
 set(PICK_PLACE_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data")
+set(INITIAL_POSITIONS_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../ur_setup_ws/config/initial_positions.yaml")
 
 # ---------------------------------------------------------------
 # 의존성 찾기
@@ -89,6 +90,9 @@ ament_target_dependencies(pick_place_node
   moveit_msgs
 )
 target_link_libraries(pick_place_node "${cpp_typesupport_target}")
+target_compile_definitions(pick_place_node PRIVATE
+  INITIAL_POSITIONS_FILE="${INITIAL_POSITIONS_FILE}"
+)
 
 # ---------------------------------------------------------------
 # motion_logger_node

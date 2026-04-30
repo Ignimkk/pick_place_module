@@ -34,8 +34,9 @@ pick_place_node:
     planning_time:         10.0  # 최대 계획 허용 시간 [s]
     num_planning_attempts: 20    # 계획 실패 시 재시도 횟수
 
-    # 그리퍼 하향 orientation (quaternion)
-    # 기본값: Y축 180° 회전 → tool Z 가 -world Z 방향 (수직 하향)
+    # 하향 orientation 폴백값
+    # 기본 동작은 현재 EE yaw 에 가장 가까운 하향 자세를 deterministic 하게 계산.
+    # 현재 상태/EE 링크를 읽지 못할 때만 아래 고정 quaternion 으로 폴백한다.
     grasp_orientation_x: 0.0
     grasp_orientation_y: 1.0
     grasp_orientation_z: 0.0
@@ -49,9 +50,22 @@ pick_place_node:
     # setFromIK 실패 시 planAndExecute(setPoseTarget) 로 fallback 됨.
     ik_timeout: 0.5
 
-    # L2 norm 가중치 (참조 코드 기본값: 0.0002)
-    # 매우 작은 값 → 현재 자세에 가까운 해를 선호하되 IK 수렴에 영향 최소화
-    ik_cost_weight_l2: 0.0002
+    # L2 norm 가중치
+    #   0.0002 : 거의 무시 — bio_ik 가 임의 분기로 수렴 가능
+    #   0.05   : pre_grasp/pre_place IK 가 grasp/place 분기에 강하게 묶임 (권장)
+    #   0.5+   : 도달성보다 분기 일관성 우선 — 멀리 있는 target 에서 IK 실패 ↑
+    ik_cost_weight_l2: 0.05
+
+    # PnP 완료 후 초기 관절 자세로 복귀
+    return_home_after_place: true
+    initial_positions_path: "/home/mk/dev_ws/robot_arm/UR/ur_setup_ws/src/ur_setup_ws/config/initial_positions.yaml"
+
+    # ── 강하 경로 충돌 검증 (pre_pose → final_pose) ───────────────
+    # pre_grasp → grasp / pre_place → place 사이를 joint-space 보간하여
+    # 각 단계마다 PlanningScene 충돌(self + world) 을 검사한다.
+    # 충돌 시 IK 를 다른 seed/random restart 로 재시도.
+    descent_check_steps:    15    # 보간 단계 수 (10–20 권장)
+    descent_max_ik_retries: 4     # IK 최대 재시도 횟수 (3–5 권장)
 
     # ── Trajectory Optimization 통합 파라미터 ────────────────────
     # use_trajopt=false (기본): 기존 MoveIt2 execute 동작 유지
@@ -101,6 +115,29 @@ pick_place_node:
     # 실험 CSV 저장 경로 (비어있으면 ~/.ros/pick_place_exp/TIMESTAMP_results.csv)
     experiment_csv_path: ""
 
+    # ── pre_grasp → grasp 접근 전략 ───────────────────────────────────
+    # "vertical_cartesian" (기본):
+    #     pre_pose ↔ final_pose 사이를 N 개 Cartesian waypoint 로 분할.
+    #     x/y/orientation 은 final_pose 값으로 고정, z 만 단조 변화 →
+    #     EE 가 수직 강하/후퇴 보장. RRT/TrajOpt 결정에 의해 휘는
+    #     joint 경로 문제를 회피.
+    # "joint":
+    #     사전 계산한 IK 로 RRT/TrajOpt 관절 plan 실행. 충돌 인지는
+    #     강하지만 EE 경로가 휠 수 있음.
+    # "cartesian":
+    #     computeCartesianPath 단일 waypoint (레거시; 자주 path
+    #     incomplete 발생).
+    approach_strategy: "vertical_cartesian"
+
+    # vertical_cartesian 분할 waypoint 수 (5–20 권장)
+    # ↑ 많을수록 IK 추적 안정성 ↑, computeCartesianPath 비용 ↑
+    vertical_cartesian_waypoints: 10
+
+    # Cartesian 접근/후퇴 공통 파라미터
+    # (approach_strategy = "cartesian" / "vertical_cartesian" 모두 사용)
+    cartesian_eef_step:     0.01    # EE 보간 간격 [m]
+    cartesian_min_fraction: 0.95    # 최소 보간 성공 비율 (이하 시 실패)
+
 
 goal_relay_node:
   ros__parameters:
@@ -111,6 +148,11 @@ goal_relay_node:
     #   1: pick_goal + place_goal 모두 수신 후
     #      Pick action 완료 → Place action 순차 실행
     trigger_mode: 0
+
+    # 단일 action(pick 또는 place) 결과를 기다리는 최대 시간 [s]
+    # 한 번의 pick 또는 place 가 이 시간보다 오래 걸리면 sequence 실패 처리.
+    # 0 이하 = 무제한 대기 (deadlock 위험, 비추천)
+    action_result_timeout_sec: 600.0
 
 
 motion_logger_node:
