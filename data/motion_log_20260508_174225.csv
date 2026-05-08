@@ -1,0 +1,4 @@
+segment_id,cum_ee_m,cum_shoulder_pan_joint_rad,cum_shoulder_lift_joint_rad,cum_elbow_joint_rad,cum_wrist_1_joint_rad,cum_wrist_2_joint_rad,cum_wrist_3_joint_rad,cum_shoulder_pan_joint_deg,cum_shoulder_lift_joint_deg,cum_elbow_joint_deg,cum_wrist_1_joint_deg,cum_wrist_2_joint_deg,cum_wrist_3_joint_deg,
+1,0.319276,0.466428,0.166654,0.508962,0.213564,0.056462,0.348225,26.724354,9.548564,29.161369,12.236331,3.235011,19.951808,
+2,0.875960,1.491008,0.423941,0.521613,0.033602,0.110400,1.149197,85.428462,24.290011,29.886198,1.925271,6.325462,65.844135,
+3,0.648422,1.032073,0.285408,0.101926,0.182009,0.000796,1.032073,59.133427,16.352702,5.839922,10.428356,0.045611,59.133416,

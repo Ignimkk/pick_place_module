@@ -36,8 +36,9 @@
  *   use_trajopt=false (기본): 기존 MoveIt2 execute 동작 유지
  *   use_trajopt=true:
  *     RRT 계획 완료 → TrajOpt Action goal 전송 → 최적화 trajectory 수신
- *     → /joint_trajectory_controller/joint_trajectory 직접 발행
- *     → T_opt + traj_exec_margin_sec 대기
+ *     → moveit_msgs::RobotTrajectory 로 감싸 move_group_->execute() 로
+ *       closed-loop 실행 (FollowJointTrajectory 액션이 컨트롤러 결과까지
+ *       블로킹 대기 — Stage 1.1 변경, 이전: publish + sleep open-loop)
  *     → trajopt 실패 시 MoveIt2 execute 로 폴백
  *
  * ── 파라미터 (config/pick_place_params.yaml) ───────────────────────
@@ -61,6 +62,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <control_msgs/action/gripper_command.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include <pick_place_module/action/pick.hpp>
@@ -68,18 +70,22 @@
 #include <pick_place_module/action/traj_opt.hpp>
 
 #include <Eigen/Dense>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -454,7 +460,9 @@ public:
       get_parameter("experiment_mode").as_string().c_str());
 
     // ── callback groups ───────────────────────────────────────────
-    gripper_cbg_  = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    // gripper 콜백은 pick·place 시퀀스가 arm 동작을 대기하는 동안에도
+    // 실행되어야 하므로 Reentrant. (Stage 1.4)
+    gripper_cbg_  = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     pick_cbg_     = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     place_cbg_    = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     trajopt_cbg_  = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -480,11 +488,13 @@ public:
       },
       [this](const std::shared_ptr<PickGoalHandle>) {
         RCLCPP_WARN(get_logger(), "[pick] Cancel requested");
-        move_group_->stop();
+        abort_requested_.store(true);   // Stage 1.2: 단계 사이 체크용
+        move_group_->stop();            // 진행 중 motion 즉시 중단
         return rclcpp_action::CancelResponse::ACCEPT;
       },
       [this](const std::shared_ptr<PickGoalHandle> gh) {
-        std::thread{[this, gh]() { executePick(gh); }}.detach();
+        // Stage 1.3: detach() → worker queue (안전한 종료를 위해)
+        enqueueTask([this, gh]() { executePick(gh); });
       },
       rcl_action_server_get_default_options(), pick_cbg_);
 
@@ -497,13 +507,33 @@ public:
       },
       [this](const std::shared_ptr<PlaceGoalHandle>) {
         RCLCPP_WARN(get_logger(), "[place] Cancel requested");
+        abort_requested_.store(true);   // Stage 1.2
         move_group_->stop();
         return rclcpp_action::CancelResponse::ACCEPT;
       },
       [this](const std::shared_ptr<PlaceGoalHandle> gh) {
-        std::thread{[this, gh]() { executePlace(gh); }}.detach();
+        // Stage 1.3: detach() → worker queue
+        enqueueTask([this, gh]() { executePlace(gh); });
       },
       rcl_action_server_get_default_options(), place_cbg_);
+
+    // ── 전역 abort 서비스 (Stage 1.2) ─────────────────────────────
+    // 어떤 goal 이 active 인지 모르는 외부(런처/감독자/E-stop relay)도
+    // 한 번의 service 호출로 pick / place 진행을 중단할 수 있다.
+    // 동작:
+    //   1) abort_requested_ = true → executePick/executePlace 의 단계
+    //      체크에서 즉시 cancel 처리.
+    //   2) move_group_->stop() → 현재 진행 중인 motion 즉시 정지.
+    abort_service_ = create_service<std_srvs::srv::Trigger>(
+      "/pick_place/cancel",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> resp) {
+        RCLCPP_WARN(get_logger(), "[abort] /pick_place/cancel invoked");
+        abort_requested_.store(true);
+        if (move_group_) move_group_->stop();
+        resp->success = true;
+        resp->message = "Abort requested; pick/place will cancel at next checkpoint";
+      });
 
     // ── 기타 publishers ───────────────────────────────────────────
     motion_log_pub_ = create_publisher<std_msgs::msg::Bool>("/motion_logger/record", 10);
@@ -541,10 +571,65 @@ public:
         "checks DISABLED (will use single IK without validation)");
     }
 
+    // Stage 1.3: 단일 worker thread 기동
+    worker_thread_ = std::thread(&PickPlaceNode::workerLoop, this);
+
     RCLCPP_INFO(get_logger(), "PickPlaceNode ready  |  /pick  /place");
   }
 
+  // Stage 1.3: 안전한 종료
+  // - shutting_down_ + abort_requested_ 둘 다 set 하여 in-flight task 가
+  //   다음 check_cancel 에서 빠져나오도록 유도.
+  // - cv 를 깨워 worker 가 큐 대기에서 탈출.
+  // - worker join → executePick/executePlace 완료까지 대기 후 멤버 파괴.
+  ~PickPlaceNode() override
+  {
+    shutting_down_.store(true);
+    abort_requested_.store(true);
+    if (move_group_) move_group_->stop();
+    queue_cv_.notify_all();
+    if (worker_thread_.joinable()) worker_thread_.join();
+  }
+
 private:
+  // Stage 1.3: worker loop — 큐에서 task 를 하나씩 꺼내 직렬 실행.
+  void workerLoop()
+  {
+    while (true) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_cv_.wait(lock, [this] {
+          return shutting_down_.load() || !task_queue_.empty();
+        });
+        if (shutting_down_.load() && task_queue_.empty()) return;
+        if (task_queue_.empty()) continue;  // spurious wakeup
+        task = std::move(task_queue_.front());
+        task_queue_.pop();
+      }
+      // shutdown 중에도 in-flight 가 아니라 "이미 큐에 들어있던" task 는
+      // 실행하지 않고 폐기 — goal handle 은 rclcpp_action 의 deadline 정리
+      // 또는 client 측 timeout 으로 처리됨.
+      if (shutting_down_.load()) continue;
+      try {
+        task();
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(get_logger(), "[worker] task threw: %s", e.what());
+      } catch (...) {
+        RCLCPP_ERROR(get_logger(), "[worker] task threw unknown exception");
+      }
+    }
+  }
+
+  void enqueueTask(std::function<void()> task)
+  {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      task_queue_.push(std::move(task));
+    }
+    queue_cv_.notify_one();
+  }
+
   // ── 현재 EE yaw 에 가장 가까운 하향 orientation 적용 ─────────────
   //
   // 입력 pose 의 position 은 유지한다. orientation 은 현재 엔드이펙터의
@@ -941,15 +1026,28 @@ private:
       res->max_torque, res->num_shortcut_waypoints,
       rec.num_opt_points);
 
-    // ── 최적화 궤적 발행 + 실행 대기 ────────────────────────────
+    // ── 최적화 궤적을 RobotTrajectory 로 감싸 closed-loop 실행 ────
+    // MoveGroupInterface::execute() 는 내부 FollowJointTrajectory 액션
+    // 클라이언트로 컨트롤러 결과까지 블로킹 대기하므로, 기존 publish+
+    // sleep_for 의 open-loop 문제(하드웨어 lag, 조기 완료 무시)를 해결한다.
+    // 실패 시 false 반환 → 호출자(planAndExecuteToJoints)가 RRT 폴백.
+    (void)exec_margin;  // closed-loop 전환 후 미사용 (호환성 유지 목적 보존)
+    moveit_msgs::msg::RobotTrajectory rt_opt;
+    rt_opt.joint_trajectory = res->optimized_trajectory;
     auto t_exec = std::chrono::steady_clock::now();
-    traj_pub_->publish(res->optimized_trajectory);
-    rclcpp::sleep_for(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(res->t_opt + exec_margin)));
+    const auto er = move_group_->execute(rt_opt);
     rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
+    if (er != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(get_logger(),
+        "[%s] TrajOpt execute 실패 (code=%d, %.2fs) — MoveIt2 폴백",
+        step_name.c_str(), er.val, rec.exec_wait_sec);
+      rec.message = "TrajOpt execute failed";
+      return false;
+    }
 
-    RCLCPP_INFO(get_logger(), "[%s] 실행 완료 (%.2fs 대기)", step_name.c_str(), rec.exec_wait_sec);
+    RCLCPP_INFO(get_logger(),
+      "[%s] 실행 완료 (closed-loop, %.2fs, t_opt=%.2fs)",
+      step_name.c_str(), rec.exec_wait_sec, res->t_opt);
     return true;
   }
 
@@ -1095,16 +1193,26 @@ private:
       "[%s][trajopt_only] TrajOpt — t_opt=%.3fs, J=%.4f, τ_max=%.1fNm, opt=%d pts",
       step_name.c_str(), res->t_opt, res->cost, res->max_torque, rec.num_opt_points);
 
-    // ── 최적화 궤적 발행 + 실행 대기 ────────────────────────────────
+    // ── 최적화 궤적을 RobotTrajectory 로 감싸 closed-loop 실행 ──────
+    // runWithTrajopt 와 동일한 사유로 publish+sleep 을 execute() 로 교체.
+    // trajopt_only 모드는 폴백이 없으므로 실패 시 false 반환만 한다.
+    (void)exec_margin;  // closed-loop 전환 후 미사용
+    moveit_msgs::msg::RobotTrajectory rt_opt;
+    rt_opt.joint_trajectory = res->optimized_trajectory;
     auto t_exec = std::chrono::steady_clock::now();
-    traj_pub_->publish(res->optimized_trajectory);
-    rclcpp::sleep_for(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(res->t_opt + exec_margin)));
+    const auto er = move_group_->execute(rt_opt);
     rec.exec_wait_sec = durationSec(t_exec, std::chrono::steady_clock::now());
+    if (er != moveit::core::MoveItErrorCode::SUCCESS) {
+      rec.message = "TrajOpt execute failed";
+      RCLCPP_ERROR(get_logger(),
+        "[%s][trajopt_only] TrajOpt execute 실패 (code=%d, %.2fs)",
+        step_name.c_str(), er.val, rec.exec_wait_sec);
+      return false;
+    }
 
     RCLCPP_INFO(get_logger(),
-      "[%s][trajopt_only] 실행 완료 (%.2fs 대기)", step_name.c_str(), rec.exec_wait_sec);
+      "[%s][trajopt_only] 실행 완료 (closed-loop, %.2fs, t_opt=%.2fs)",
+      step_name.c_str(), rec.exec_wait_sec, res->t_opt);
     return true;
   }
 
@@ -1722,6 +1830,9 @@ private:
   void executePick(const std::shared_ptr<PickGoalHandle> gh)
   {
     std::lock_guard<std::mutex> exec_lock(exec_mutex_);
+    // Stage 1.2: 새 시퀀스 시작 시 stale abort 플래그 리셋. 직전 cycle
+    // 이후 외부에서 호출된 cancel 은 이 시점에 "소비"된다.
+    abort_requested_.store(false);
     auto result = std::make_shared<Pick::Result>();
 
     const double offset       = get_parameter("pre_grasp_offset").as_double();
@@ -1731,16 +1842,31 @@ private:
     const double gripper_to   = get_parameter("gripper_timeout_sec").as_double();
     const std::string strat   = get_parameter("approach_strategy").as_string();
 
+    // Stage 1.2 fix: goal handle 상태에 따라 올바른 terminal 전이 호출.
+    // - CANCELING (action cancel 수락 후): canceled() 만 허용
+    // - EXECUTING (정상 또는 service abort): abort() 또는 succeed()
+    // 이전 코드는 CANCELING 상태에서 abort() 호출 → IllegalTransitionException
+    // → terminate → SIGABRT (exit -6) 의 잠재 버그가 있었음.
     auto abort_with = [&](const std::string & msg) {
       RCLCPP_ERROR(get_logger(), "[pick] ABORT: %s", msg.c_str());
       result->success = false; result->message = msg;
-      gh->abort(result);
+      if (gh->is_canceling()) gh->canceled(result);
+      else                    gh->abort(result);
     };
     auto check_cancel = [&]() -> bool {
+      // action-level cancel + 전역 abort 플래그 둘 다 체크 (Stage 1.2)
       if (gh->is_canceling()) {
-        result->success = false; result->message = "Cancelled by client";
-        gh->canceled(result);
-        RCLCPP_WARN(get_logger(), "[pick] Cancelled by client");
+        result->success = false;
+        result->message = "Cancelled by client";
+        gh->canceled(result);     // CANCELING → canceled() 합법
+        RCLCPP_WARN(get_logger(), "[pick] %s", result->message.c_str());
+        return true;
+      }
+      if (abort_requested_.load()) {
+        result->success = false;
+        result->message = "Aborted by /pick_place/cancel";
+        gh->abort(result);        // EXECUTING → abort() 합법
+        RCLCPP_WARN(get_logger(), "[pick] %s", result->message.c_str());
         return true;
       }
       return false;
@@ -1925,8 +2051,15 @@ private:
     fb("Pick complete", 1.0f);
     result->success = true;
     result->message = "Pick completed successfully";
-    gh->succeed(result);
-    RCLCPP_INFO(get_logger(), "[pick] Task SUCCEEDED");
+    // Stage 1.2 fix: retreat 직후 cancel 이 들어와 CANCELING 상태일 수 있음.
+    if (gh->is_canceling()) {
+      result->message = "Pick succeeded but cancel was requested";
+      gh->canceled(result);
+      RCLCPP_WARN(get_logger(), "[pick] Succeeded but reported as cancelled (cancel raced succeed)");
+    } else {
+      gh->succeed(result);
+      RCLCPP_INFO(get_logger(), "[pick] Task SUCCEEDED");
+    }
   }
 
   // ── Place 실행 ───────────────────────────────────────────────
@@ -1935,6 +2068,8 @@ private:
   void executePlace(const std::shared_ptr<PlaceGoalHandle> gh)
   {
     std::lock_guard<std::mutex> exec_lock(exec_mutex_);
+    // Stage 1.2: stale abort 플래그 리셋
+    abort_requested_.store(false);
     auto result = std::make_shared<Place::Result>();
 
     const double offset       = get_parameter("pre_grasp_offset").as_double();
@@ -1943,16 +2078,26 @@ private:
     const double gripper_to   = get_parameter("gripper_timeout_sec").as_double();
     const std::string strat   = get_parameter("approach_strategy").as_string();
 
+    // Stage 1.2 fix: executePick 와 동일 — goal state aware terminal 전이.
     auto abort_with = [&](const std::string & msg) {
       RCLCPP_ERROR(get_logger(), "[place] ABORT: %s", msg.c_str());
       result->success = false; result->message = msg;
-      gh->abort(result);
+      if (gh->is_canceling()) gh->canceled(result);
+      else                    gh->abort(result);
     };
     auto check_cancel = [&]() -> bool {
       if (gh->is_canceling()) {
-        result->success = false; result->message = "Cancelled by client";
+        result->success = false;
+        result->message = "Cancelled by client";
         gh->canceled(result);
-        RCLCPP_WARN(get_logger(), "[place] Cancelled by client");
+        RCLCPP_WARN(get_logger(), "[place] %s", result->message.c_str());
+        return true;
+      }
+      if (abort_requested_.load()) {
+        result->success = false;
+        result->message = "Aborted by /pick_place/cancel";
+        gh->abort(result);
+        RCLCPP_WARN(get_logger(), "[place] %s", result->message.c_str());
         return true;
       }
       return false;
@@ -2156,8 +2301,14 @@ private:
     fb("Place complete", 1.0f);
     result->success = true;
     result->message = "Place completed successfully";
-    gh->succeed(result);
-    RCLCPP_INFO(get_logger(), "[place] Task SUCCEEDED");
+    if (gh->is_canceling()) {
+      result->message = "Place succeeded but cancel was requested";
+      gh->canceled(result);
+      RCLCPP_WARN(get_logger(), "[place] Succeeded but reported as cancelled (cancel raced succeed)");
+    } else {
+      gh->succeed(result);
+      RCLCPP_INFO(get_logger(), "[place] Task SUCCEEDED");
+    }
   }
 
   // ── members ───────────────────────────────────────────────────
@@ -2183,6 +2334,24 @@ private:
   std::mutex exec_mutex_;
   int trial_id_ = 0;
   std::shared_ptr<CsvLogger> csv_logger_;
+
+  // Stage 1.2: 전역 abort 플래그 + 서비스
+  // - cancel callback / /pick_place/cancel service 가 set
+  // - executePick/executePlace 의 단계 체크에서 read
+  // - executePick/executePlace 시작 시 false 로 리셋 → "stale" 호출 무시
+  std::atomic<bool> abort_requested_{false};
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr abort_service_;
+
+  // Stage 1.3: 단일 worker thread + task queue
+  // - goal accept callback 이 detach 대신 큐에 enqueue
+  // - 노드 destructor 가 shutting_down_=true → notify → join 으로
+  //   in-flight task 의 use-after-free 위험 제거.
+  // - exec_mutex_ 는 단일 worker 로 자연 serialize 되지만 호환성 유지.
+  std::thread                       worker_thread_;
+  std::mutex                        queue_mutex_;
+  std::condition_variable           queue_cv_;
+  std::queue<std::function<void()>> task_queue_;
+  std::atomic<bool>                 shutting_down_{false};
 
   // PlanningSceneMonitor: 강하 경로 self/world 충돌 검사용.
   // null 일 수 있음 → 검사 스킵 처리.
