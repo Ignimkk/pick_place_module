@@ -1,0 +1,89 @@
+# =============================================================
+# scenarios.yaml
+#
+# 2026 KIIE conference experiment scenarios.
+#
+# Each scenario defines:
+#   - obstacle_enabled : whether to spawn the testbed obstacle
+#   - pick_*_range     : uniform sampling bounds for the pick pose
+#   - place_*_range    : uniform sampling bounds for the place pose
+#
+# Modes (5):
+#   A  : rrt_only            (MoveIt2 RRTConnect only — baseline)
+#   B  : trajopt_only        (TrajOpt only, no RRT seed)
+#   C  : rrt_trajopt         (RRT → TrajOpt, reduced+free-T — recommended)
+#   C1 : rrt_trajopt_full    (RRT → TrajOpt full SLSQP, torque enforced)
+#   C2 : rrt_trajopt_fixedT  (RRT → TrajOpt with fixed T_init)
+#
+# Trials per (scenario × mode) : 20
+# Total trials                 : 2 × 5 × 20 = 200
+# =============================================================
+
+scenarios:
+  S1:
+    obstacle_enabled: false
+    pick_x_range:  [ 0.30,  0.50]
+    pick_y_range:  [ 0.20,  0.50]
+    pick_z_range:  [ 0.30,  0.50]
+    place_x_range: [-0.50, -0.30]
+    place_y_range: [ 0.30,  0.50]
+    place_z_range: [ 0.30,  0.50]
+
+  S2:
+    obstacle_enabled: true
+    obstacle:
+      name: "testbed_obstacle"
+      sdf_pkg: "ur_setup_bringup"
+      sdf_relpath: "models/testbed_obstacle/model.sdf"
+      spawn_xyz: [0.0, 0.35, 1.0]
+      # Collision primitive published to MoveIt PlanningScene
+      collision:
+        frame_id: "world"
+        size: [0.05, 0.30, 0.40]   # box dimensions [x, y, z]
+        position: [0.0, 0.45, 1.0]
+    pick_x_range:  [ 0.30,  0.50]
+    pick_y_range:  [ 0.20,  0.50]
+    pick_z_range:  [ 0.30,  0.50]
+    place_x_range: [-0.50, -0.30]
+    place_y_range: [ 0.30,  0.50]
+    place_z_range: [ 0.30,  0.50]
+
+modes:
+  A:
+    label: "rrt_only"
+    params:
+      experiment_mode: "rrt_only"
+      use_trajopt: false
+  B:
+    label: "trajopt_only"
+    params:
+      experiment_mode: "trajopt_only"
+      use_trajopt: true
+      trajopt_use_reduced: true
+      trajopt_use_free_t: true
+  C:
+    label: "rrt_trajopt"
+    params:
+      experiment_mode: "rrt_trajopt"
+      use_trajopt: true
+      trajopt_use_reduced: true
+      trajopt_use_free_t: true
+
+# Number of trials per (scenario × mode)
+trials_per_cell: 20
+
+# Master RNG seed: per-trial seed = master_seed + scenario_idx*1000 + mode_idx*100 + trial_idx
+master_seed: 20260504
+
+# Object-fixed orientation (downward grasp) — quaternion
+grasp_orientation:
+  x: 0.0
+  y: 1.0
+  z: 0.0
+  w: 0.0
+
+# Per-trial timeouts
+timeouts:
+  pick_action_sec:  120.0
+  place_action_sec: 120.0
+  param_set_sec:      5.0

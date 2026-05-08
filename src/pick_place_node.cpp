@@ -371,7 +371,11 @@ public:
   using MoveGroupIface  = moveit::planning_interface::MoveGroupInterface;
 
   explicit PickPlaceNode(std::shared_ptr<rclcpp::Node> move_group_node)
-  : Node("pick_place_node")
+  : Node("pick_place_node",
+         // allow_undeclared_parameters: set_parameters 서비스가 declare_parameter 보다
+         // 먼저 호출되는 race condition(노드 시작 직후 runner 접속)에서도
+         // "not declared" 오류 없이 파라미터를 수신할 수 있게 한다.
+         rclcpp::NodeOptions().allow_undeclared_parameters(true))
   {
     // ── 파라미터 선언 ─────────────────────────────────────────────
     declare_parameter<std::string>("arm_group",            "ur_manipulator");

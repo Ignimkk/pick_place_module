@@ -176,4 +176,14 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Python experiment-automation scripts (KIIE 2026)
+install(
+  PROGRAMS
+    scripts/experiment_runner.py
+    scripts/aggregate_results.py
+    scripts/plot_results.py
+    scripts/analyze_results.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
