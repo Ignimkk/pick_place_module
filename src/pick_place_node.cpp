@@ -181,6 +181,7 @@ struct ExperimentRecord {
   int         trial_id           = 0;
   std::string step_name;
   std::string experiment_mode;
+  std::string planner_id;        // Phase A — RRTConnect / RRTstar / BiTRRT / ...
   bool        success            = false;
   bool        fallback_used      = false;
   double      ik_time_sec        = 0.0;
@@ -305,6 +306,7 @@ public:
     ofs_ << r.trial_id                << ","
          << r.step_name               << ","
          << r.experiment_mode         << ","
+         << r.planner_id              << ","
          << r.success                 << ","
          << r.fallback_used           << ","
          << f(r.ik_time_sec)          << ","
@@ -338,7 +340,7 @@ public:
 
 private:
   void writeHeader() {
-    ofs_ << "trial_id,step_name,experiment_mode,success,fallback_used,"
+    ofs_ << "trial_id,step_name,experiment_mode,planner_id,success,fallback_used,"
             "ik_time_sec,rrt_planning_sec,shortcut_time_sec,"
             "initial_guess_time_sec,solve_time_sec,total_compute_sec,"
             "exec_wait_sec,num_rrt_points,num_shortcut_waypoints,"
@@ -392,6 +394,10 @@ public:
     declare_parameter<double>("acceleration_scaling",      0.3);
     declare_parameter<double>("planning_time",             10.0);
     declare_parameter<int>   ("num_planning_attempts",     20);
+    // Phase A — runtime-changeable planner ID. planAndExecuteToJoints 가
+    // 매 plan 직전에 이 값을 읽어 setPlannerId() 호출. 외부 benchmark runner
+    // 가 set_parameters 서비스로 값을 바꾸면 다음 사이클부터 즉시 반영.
+    declare_parameter<std::string>("planner_id", "RRTConnectkConfigDefault");
     declare_parameter<double>("gripper_max_effort",        50.0);
     declare_parameter<double>("gripper_timeout_sec",       10.0);
     declare_parameter<double>("cartesian_eef_step",        0.01);
@@ -443,7 +449,7 @@ public:
     // ── MoveGroupInterface 초기화 ────────────────────────────────
     const std::string arm = get_parameter("arm_group").as_string();
     move_group_ = std::make_shared<MoveGroupIface>(move_group_node, arm);
-    move_group_->setPlannerId("RRTConnectkConfigDefault");
+    move_group_->setPlannerId(get_parameter("planner_id").as_string());
     move_group_->setMaxVelocityScalingFactor(get_parameter("velocity_scaling").as_double());
     move_group_->setMaxAccelerationScalingFactor(get_parameter("acceleration_scaling").as_double());
     move_group_->setPlanningTime(get_parameter("planning_time").as_double());
@@ -456,6 +462,8 @@ public:
     RCLCPP_INFO(get_logger(), "End effector link   : %s", move_group_->getEndEffectorLink().c_str());
     RCLCPP_INFO(get_logger(), "use_trajopt         : %s",
       get_parameter("use_trajopt").as_bool() ? "true" : "false");
+    RCLCPP_INFO(get_logger(), "planner_id (init)   : %s",
+      get_parameter("planner_id").as_string().c_str());
     RCLCPP_INFO(get_logger(), "experiment_mode     : %s",
       get_parameter("experiment_mode").as_string().c_str());
 
@@ -1546,6 +1554,13 @@ private:
   {
     const std::string mode = get_parameter("experiment_mode").as_string();
     rec.experiment_mode = mode;
+
+    // Phase A — runtime planner switch.
+    // benchmark_runner 가 set_parameters 로 planner_id 를 변경하면 다음 사이클의
+    // 이 호출에서 즉시 반영. CSV 에는 실제 사용된 planner 가 기록됨.
+    const std::string planner = get_parameter("planner_id").as_string();
+    rec.planner_id = planner;
+    move_group_->setPlannerId(planner);
 
     // 현재 robot state 취득
     auto rs = move_group_->getCurrentState(2.0);

@@ -1,0 +1,17 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / local settings
+.vscode/
+.codex/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Experiment logs
+data/motion_log_*.csv

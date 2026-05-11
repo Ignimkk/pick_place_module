@@ -181,6 +181,9 @@ install(
 # Python experiment-automation scripts (KIIE 2026)
 install(
   PROGRAMS
+    scripts/gazebo_experiment_common.py
+    scripts/run_trajopt_only_experiments.py
+    scripts/run_rrt_trajopt_experiments.py
     scripts/experiment_runner.py
     scripts/aggregate_results.py
     scripts/plot_results.py

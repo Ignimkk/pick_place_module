@@ -85,7 +85,16 @@ def generate_launch_description():
         Node(
             package="pick_place_module",
             executable="pick_place_node",
-            name="pick_place_node",
+            # name=... 을 명시하지 않는다.
+            # main() 이 두 노드를 만드는데
+            #   1) "pick_place_move_group_interface" (MoveGroupInterface 보조)
+            #   2) "pick_place_node"                  (PickPlaceNode 자체)
+            # 여기서 name="pick_place_node" 를 주면 ROS2 launch_ros 가
+            # `--ros-args -r __node:=pick_place_node` 를 추가하여 **두 노드
+            # 모두**의 이름을 동일하게 덮어쓴다. 그 결과 ros2 graph 에
+            # `/pick_place_node` 가 두 번 등장하며 set_parameters service
+            # 호출이 두 endpoint 사이에 random dispatch 되어 cycle 마다
+            # planner_id 적용 여부가 불안정해진다.
             output="screen",
             parameters=[
                 config,

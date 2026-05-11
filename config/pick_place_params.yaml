@@ -34,6 +34,19 @@ pick_place_node:
     planning_time:         10.0  # 최대 계획 허용 시간 [s]
     num_planning_attempts: 20    # 계획 실패 시 재시도 횟수
 
+    # ── Phase A — runtime planner switch ────────────────────────────
+    # planAndExecuteToJoints() 매 호출 시 이 값을 읽어 setPlannerId().
+    # 외부 benchmark_runner 가 /pick_place_node/set_parameters 서비스로
+    # 변경하면 다음 사이클부터 즉시 반영됨.
+    # 후보 (ompl_planning.yaml 에 정의된 것만 사용 가능):
+    #   RRTConnectkConfigDefault   (현재 default)
+    #   RRTstarkConfigDefault       asymptotically optimal
+    #   BiTRRTkConfigDefault        bidirectional T-RRT
+    #   LBKPIECEkConfigDefault      lazy projection-based
+    #   BITstarkConfigDefault       batch informed trees
+    #   PRMstarkConfigDefault       probabilistic roadmap
+    planner_id: "RRTConnectkConfigDefault"
+
     # 하향 orientation 폴백값
     # 기본 동작은 현재 EE yaw 에 가장 가까운 하향 자세를 deterministic 하게 계산.
     # 현재 상태/EE 링크를 읽지 못할 때만 아래 고정 quaternion 으로 폴백한다.

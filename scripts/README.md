@@ -85,6 +85,10 @@ mkdir -p "$(dirname "$EXP_CSV")"
 rm -f "$EXP_CSV"
 
 ros2 launch pick_place_module pick_place.launch.py \
+    use_sim_time:=true \
+    trigger_mode:=1 \
+    enable_logger:=true \
+    experiment_mode:=rrt_trajopt \
     experiment_csv_path:="$EXP_CSV"
 ```
 
@@ -118,6 +122,39 @@ ros2 run pick_place_module experiment_runner.py \
     --node-csv ... --out ... \
     --scenarios S1 --modes A,C --trials-per-cell 5
 ```
+
+## Two-Mode Gazebo KPI Scripts
+
+For a direct A/B comparison between TrajOpt without an RRT seed and RRT-warmed
+TrajOpt, use the dedicated wrappers:
+
+```bash
+EXP_CSV=$HOME/.ros/pick_place_exp/node_data.csv
+
+# Terminal 3 must launch pick_place_node with the same path:
+ros2 launch pick_place_module pick_place.launch.py \
+    use_sim_time:=true \
+    trigger_mode:=1 \
+    enable_logger:=true \
+    experiment_mode:=trajopt_only \
+    experiment_csv_path:="$EXP_CSV"
+
+# Terminal 4:
+python3 scripts/run_trajopt_only_experiments.py \
+    --trials 20 \
+    --node-csv "$EXP_CSV" \
+    --output results/trajopt_only_gazebo_kpi.csv
+
+python3 scripts/run_rrt_trajopt_experiments.py \
+    --trials 20 \
+    --node-csv "$EXP_CSV" \
+    --output results/rrt_trajopt_gazebo_kpi.csv
+```
+
+Both scripts set `/pick_place_node` parameters for their mode, run deterministic
+pick/place trials, and append the node KPI columns plus trial metadata to the
+output CSV. The `--seed` default is identical for both scripts, so matching
+trial indices use the same pick/place poses.
 
 ## Reproducibility
 
