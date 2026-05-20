@@ -68,8 +68,21 @@ ament_target_dependencies(goal_relay_node
   rclcpp
   rclcpp_action
   geometry_msgs
+  std_msgs
 )
 target_link_libraries(goal_relay_node "${cpp_typesupport_target}")
+
+# ---------------------------------------------------------------
+# edge_brain_dispatcher_node
+# 역할: plate 위 9개 알파벳을 차례로 집어 pallet 위에 "EDGE BRAIN"
+#       순서로 3x3 격자 배치. /pick · /place action 을 순차 호출.
+# ---------------------------------------------------------------
+add_executable(edge_brain_dispatcher_node src/edge_brain_dispatcher_node.cpp)
+ament_target_dependencies(edge_brain_dispatcher_node
+  rclcpp
+  geometry_msgs
+  std_msgs
+)
 
 # ---------------------------------------------------------------
 # pick_place_node
@@ -163,6 +176,7 @@ target_compile_definitions(rrt_path_recorder_node PRIVATE
 install(
   TARGETS
     goal_relay_node
+    edge_brain_dispatcher_node
     pick_place_node
     motion_logger_node
     ee_pose_publisher
@@ -188,6 +202,7 @@ install(
     scripts/aggregate_results.py
     scripts/plot_results.py
     scripts/analyze_results.py
+    scripts/preview_alphabet_collision.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

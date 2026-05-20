@@ -17,8 +17,8 @@ pick_place_node:
     # 그리퍼 위치 [m]
     # robotiq_2f_85: 완전 열림=0.0, 완전 닫힘≈0.085
     # (시뮬레이션에서는 0.0~0.8 스케일 사용)
-    gripper_open_pos:  0.0
-    gripper_close_pos: 0.8
+    gripper_open_pos:  0.3
+    gripper_close_pos: 0.7
 
     # 그리퍼 최대 토크 [N]
     gripper_max_effort: 50.0

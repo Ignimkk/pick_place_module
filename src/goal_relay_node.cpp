@@ -28,6 +28,7 @@
 #include <rclcpp/callback_group.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <pick_place_module/action/pick.hpp>
 #include <pick_place_module/action/place.hpp>
@@ -92,6 +93,12 @@ public:
       this, "pick", client_cbg_);
     place_client_ = rclcpp_action::create_client<Place>(
       this, "place", client_cbg_);
+
+    // mode 1 sequential pick→place 완료 시 발행하는 done 토픽.
+    // 외부 시퀀서(예: edge_brain_dispatcher)가 이 신호를 받아 다음 pair 를 전송.
+    //   data = true  → pick+place 모두 성공
+    //   data = false → pick 또는 place 실패
+    done_pub_ = create_publisher<std_msgs::msg::Bool>("pickplace_done", 10);
 
     RCLCPP_INFO(get_logger(),
       "[goal_relay] GoalRelayNode started  trigger_mode=%ld",
@@ -180,6 +187,7 @@ private:
     if (!pick_ok) {
       RCLCPP_ERROR(get_logger(),
         "[goal_relay] pick failed — aborting place (sequence aborted)");
+      publishDone(false);
       resetExecutingFlags();
       return;
     }
@@ -202,7 +210,18 @@ private:
         "[goal_relay] place failed — sequence ended with error");
     }
 
+    publishDone(place_ok);
     resetExecutingFlags();
+  }
+
+  void publishDone(bool success)
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = success;
+    done_pub_->publish(msg);
+    RCLCPP_INFO(get_logger(),
+      "[goal_relay] /pickplace_done published  success=%s",
+      success ? "true" : "false");
   }
 
   void resetExecutingFlags()
@@ -487,6 +506,9 @@ private:
   rclcpp::CallbackGroup::SharedPtr        client_cbg_;
   rclcpp_action::Client<Pick>::SharedPtr  pick_client_;
   rclcpp_action::Client<Place>::SharedPtr place_client_;
+
+  // ---- done publisher (mode 1 only) ----
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr done_pub_;
 
   // ---- state (mutex_ 로 보호) ----
   geometry_msgs::msg::Pose pick_pose_{};

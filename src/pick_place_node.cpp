@@ -61,6 +61,7 @@
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <control_msgs/action/gripper_command.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
@@ -388,8 +389,8 @@ public:
     // ── 파라미터 선언 ─────────────────────────────────────────────
     declare_parameter<std::string>("arm_group",            "ur_manipulator");
     declare_parameter<double>("pre_grasp_offset",          0.10);
-    declare_parameter<double>("gripper_open_pos",          0.0);
-    declare_parameter<double>("gripper_close_pos",         0.8);
+    declare_parameter<double>("gripper_open_pos",          0.4);
+    declare_parameter<double>("gripper_close_pos",         0.7);
     declare_parameter<double>("velocity_scaling",          0.3);
     declare_parameter<double>("acceleration_scaling",      0.3);
     declare_parameter<double>("planning_time",             10.0);
@@ -399,13 +400,32 @@ public:
     // 가 set_parameters 서비스로 값을 바꾸면 다음 사이클부터 즉시 반영.
     declare_parameter<std::string>("planner_id", "RRTConnectkConfigDefault");
     declare_parameter<double>("gripper_max_effort",        50.0);
-    declare_parameter<double>("gripper_timeout_sec",       10.0);
+    // gripper open/close 완료 대기 timeout [wall-clock seconds].
+    //   주의: std::chrono 기반이므로 use_sim_time 과 무관하게 실제 시간.
+    //   STL 메시 충돌 등으로 RTF 가 낮은 시뮬레이션에서는 sim time 1~2s 이
+    //   wall time 으로 5~15s 가 되므로 넉넉히 잡아야 함.
+    declare_parameter<double>("gripper_timeout_sec",       60.0);
+    // 자체 stall 검출 파라미터 (controller 측 stall 검출과 무관하게 동작).
+    //   gripper 가 close 명령 후 knuckle joint velocity 가 stall_vel_thresh 미만으로
+    //   stall_time_sec 동안 유지되면 grasp 성공으로 판정.
+    //   controller 의 stall 임계가 너무 타이트하거나 sim 오실레이션으로 검출 안 되는
+    //   상황에서도 안정적으로 close 단계를 통과시키는 fallback.
+    declare_parameter<std::string>("gripper_joint_name", "robotiq_85_left_knuckle_joint");
+    declare_parameter<double>("gripper_self_stall_vel_thresh", 0.05);   // rad/s
+    declare_parameter<double>("gripper_self_stall_time_sec",   0.5);    // s
+    // self-stall 검출은 "close" 동작에서만 활성화. close 로 간주할 목표 위치 임계.
+    //   (gripper_close_pos=0.8 기본이므로 0.4 면 open(0.0) 과 명확히 구분됨)
+    declare_parameter<double>("gripper_close_pos_threshold", 0.4);
     declare_parameter<double>("cartesian_eef_step",        0.01);
     declare_parameter<double>("cartesian_min_fraction",    0.95);
     declare_parameter<double>("grasp_orientation_x",  0.0);
     declare_parameter<double>("grasp_orientation_y",  1.0);
     declare_parameter<double>("grasp_orientation_z",  0.0);
     declare_parameter<double>("grasp_orientation_w",  0.0);
+    // true 면 입력 pose 의 orientation 을 그대로 사용한다.
+    //   (false = 기존 동작: applyDownwardOrientation() 으로 자동 보정.
+    //    호출자가 per-target yaw 를 정확히 제어하고 싶을 때 true 로 설정.)
+    declare_parameter<bool>("use_input_orientation", false);
     declare_parameter<double>("ik_timeout",           0.5);
     declare_parameter<double>("ik_cost_weight_l2",    0.05);
     declare_parameter<bool>("return_home_after_place", true);
@@ -478,6 +498,28 @@ public:
     // ── gripper action client ─────────────────────────────────────
     gripper_client_ = rclcpp_action::create_client<GripperCommand>(
       this, "robotiq_gripper_controller/gripper_cmd", gripper_cbg_);
+
+    // ── gripper joint velocity 모니터링 (self-stall 검출용) ───────
+    // /joint_states 에서 robotiq_85_left_knuckle_joint 의 velocity 를 추적.
+    // gripper_cbg_ (Reentrant) 에 묶어 controlGripper 의 polling 루프와 동시 처리.
+    {
+      rclcpp::SubscriptionOptions js_opts;
+      js_opts.callback_group = gripper_cbg_;
+      gripper_joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+        "/joint_states", 50,
+        [this](sensor_msgs::msg::JointState::SharedPtr msg) {
+          const std::string jname =
+            get_parameter("gripper_joint_name").as_string();
+          for (size_t i = 0; i < msg->name.size(); ++i) {
+            if (msg->name[i] == jname) {
+              if (i < msg->velocity.size()) {
+                latest_gripper_vel_.store(msg->velocity[i]);
+              }
+              return;
+            }
+          }
+        }, js_opts);
+    }
 
     // ── TrajOpt action client ─────────────────────────────────────
     trajopt_client_ = rclcpp_action::create_client<TrajOpt>(
@@ -742,18 +784,88 @@ private:
       [promise](const rclcpp_action::ClientGoalHandle<GripperCommand>::SharedPtr & gh) {
         if (!gh) { promise->set_value(false); }
       };
+    // 성공 판정 기준:
+    //   1) action 이 SUCCEEDED 로 종료 (정상 도달 또는 stall by max_effort)
+    //   2) result.stalled = true  (구버전/일부 구현은 ABORTED 로 오면서 stalled 만 표시)
+    //     → 물체를 잡아 더 못 움직이는 상태이므로 grasp 성공으로 간주.
+    //   3) reached_goal = true   (보수적 보강: 도달했다는 명시 신호)
+    auto logger = get_logger();
     opts.result_callback =
-      [promise](const rclcpp_action::ClientGoalHandle<GripperCommand>::WrappedResult & res) {
-        promise->set_value(res.code == rclcpp_action::ResultCode::SUCCEEDED);
+      [promise, logger](const rclcpp_action::ClientGoalHandle<GripperCommand>::WrappedResult & res) {
+        const bool succeeded =
+          (res.code == rclcpp_action::ResultCode::SUCCEEDED);
+        const bool stalled =
+          res.result && res.result->stalled;
+        const bool reached =
+          res.result && res.result->reached_goal;
+        const bool ok = succeeded || stalled || reached;
+        if (res.result) {
+          RCLCPP_INFO(logger,
+            "[gripper] code=%d  pos=%.4f  effort=%.2f  stalled=%s  reached=%s  → %s",
+            static_cast<int>(res.code),
+            res.result->position, res.result->effort,
+            stalled ? "true" : "false",
+            reached ? "true" : "false",
+            ok ? "OK (grasped or reached)" : "FAIL");
+        }
+        promise->set_value(ok);
       };
     gripper_client_->async_send_goal(goal, opts);
-    if (future.wait_for(std::chrono::duration<double>(timeout_sec)) ==
-        std::future_status::timeout)
-    {
-      RCLCPP_ERROR(get_logger(), "Gripper timed out (%.1f s)", timeout_sec);
-      return false;
+
+    // ── self-stall 폴링 루프 ─────────────────────────────────────
+    // 1) action 결과가 자연적으로 오면 그 결과를 반환.
+    // 2) close 동작에서만, knuckle joint velocity 가 self_vel_thresh 미만으로
+    //    self_time_sec 동안 유지되면 grasp 성공으로 자체 판정 후 즉시 true 반환.
+    //    (action 자체는 background 에서 계속 실행되며, 다음 gripper 명령이
+    //     자동 preempt 함. close 자세 유지는 controller 의 position hold 로 OK.)
+    // 3) 둘 다 안 일어나면 timeout 후 false.
+    const double self_vel_thresh =
+      get_parameter("gripper_self_stall_vel_thresh").as_double();
+    const double self_time_sec =
+      get_parameter("gripper_self_stall_time_sec").as_double();
+    const double close_threshold =
+      get_parameter("gripper_close_pos_threshold").as_double();
+    const bool is_close_action = (position >= close_threshold);
+
+    const auto t_start = std::chrono::steady_clock::now();
+    auto t_last_movement = t_start;
+    const auto t_deadline =
+      t_start + std::chrono::duration<double>(timeout_sec);
+
+    while (rclcpp::ok()) {
+      // (1) 자연 종료 — 100ms 단위로 future 확인
+      if (future.wait_for(std::chrono::milliseconds(100)) ==
+          std::future_status::ready)
+      {
+        return future.get();
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+
+      // (2) self-stall (close 동작 한정)
+      if (is_close_action) {
+        const double v = std::abs(latest_gripper_vel_.load());
+        if (v >= self_vel_thresh) {
+          t_last_movement = now;
+        } else if (std::chrono::duration<double>(now - t_last_movement).count()
+                     > self_time_sec)
+        {
+          RCLCPP_INFO(get_logger(),
+            "[gripper] self-stall detected (|vel|=%.4f < %.4f for %.2fs) — "
+            "treating close as grasp success (action stays running in background, "
+            "preempted by next gripper goal)",
+            v, self_vel_thresh, self_time_sec);
+          return true;
+        }
+      }
+
+      // (3) 전체 timeout
+      if (now > t_deadline) {
+        RCLCPP_ERROR(get_logger(), "Gripper timed out (%.1f s)", timeout_sec);
+        return false;
+      }
     }
-    return future.get();
+    return false;
   }
 
   // ── motion_logger 트리거 ─────────────────────────────────────
@@ -1893,8 +2005,13 @@ private:
       RCLCPP_INFO(get_logger(), "[pick][%5.1f%%] %s", progress * 100.0f, status.c_str());
     };
 
+    // use_input_orientation=true 면 호출자가 지정한 orientation 그대로 사용.
+    //   (per-target yaw 제어가 필요한 dispatcher 용 경로)
+    // false 면 기존 동작: 현재 EE yaw 기반 downward orientation 자동 적용.
     const geometry_msgs::msg::Pose grasp_pose =
-      applyDownwardOrientation(gh->get_goal()->pick_pose);
+      get_parameter("use_input_orientation").as_bool()
+        ? gh->get_goal()->pick_pose
+        : applyDownwardOrientation(gh->get_goal()->pick_pose);
     geometry_msgs::msg::Pose pre_grasp_pose = grasp_pose;
     pre_grasp_pose.position.z += offset;
 
@@ -2125,7 +2242,9 @@ private:
     };
 
     const geometry_msgs::msg::Pose place_pose =
-      applyDownwardOrientation(gh->get_goal()->place_pose);
+      get_parameter("use_input_orientation").as_bool()
+        ? gh->get_goal()->place_pose
+        : applyDownwardOrientation(gh->get_goal()->place_pose);
     geometry_msgs::msg::Pose pre_place_pose = place_pose;
     pre_place_pose.position.z += offset;
 
@@ -2344,6 +2463,11 @@ private:
   rclcpp::CallbackGroup::SharedPtr pick_cbg_;
   rclcpp::CallbackGroup::SharedPtr place_cbg_;
   rclcpp::CallbackGroup::SharedPtr gripper_cbg_;
+
+  // self-stall 검출용
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+    gripper_joint_state_sub_;
+  std::atomic<double> latest_gripper_vel_{1.0};   // 초기값 ≥ stall_thresh → false-trigger 방지
   rclcpp::CallbackGroup::SharedPtr trajopt_cbg_;
 
   std::mutex exec_mutex_;
