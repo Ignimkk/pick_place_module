@@ -63,6 +63,7 @@
 #include <control_msgs/action/gripper_command.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
@@ -498,6 +499,13 @@ public:
     // ── gripper action client ─────────────────────────────────────
     gripper_client_ = rclcpp_action::create_client<GripperCommand>(
       this, "robotiq_gripper_controller/gripper_cmd", gripper_cbg_);
+
+    // ── DetachableJoint 공용 release 토픽 publisher ─────────────────
+    // place 의 gripper open 직전에 한 번 publish 하여 attached letter 를
+    // gripper 로부터 분리. 모든 알파벳 플러그인이 동일 토픽을 detach_topic
+    // 으로 구독하므로 한 번의 publish 로 충분.
+    release_pub_ = create_publisher<std_msgs::msg::Empty>(
+      "/grasp/release_all", 10);
 
     // ── gripper joint velocity 모니터링 (self-stall 검출용) ───────
     // /joint_states 에서 robotiq_85_left_knuckle_joint 의 velocity 를 추적.
@@ -2354,6 +2362,14 @@ private:
     // ── Step 5: release ──
     fb("Step5: Releasing object", 0.75f);
     if (check_cancel()) return;
+    // DetachableJoint 가 letter 를 gripper 에 매달고 있을 수 있으므로
+    // gripper open 직전에 공용 detach 토픽을 한 번 publish.
+    // 현재 attach 상태가 아닌 letter 는 idempotent 하게 무시됨.
+    if (release_pub_) {
+      release_pub_->publish(std_msgs::msg::Empty());
+      RCLCPP_INFO(get_logger(),
+        "[place] /grasp/release_all published (pre-gripper-open)");
+    }
     if (!controlGripper(grp_open, max_effort, gripper_to)) {
       abort_with("Failed to open gripper at place"); return;
     }
@@ -2451,6 +2467,7 @@ private:
   rclcpp_action::Server<Pick>::SharedPtr               pick_server_;
   rclcpp_action::Server<Place>::SharedPtr              place_server_;
   rclcpp_action::Client<GripperCommand>::SharedPtr     gripper_client_;
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr   release_pub_;
   rclcpp_action::Client<TrajOpt>::SharedPtr            trajopt_client_;
 
   // 최적화 궤적 직접 발행 (TrajOpt 사용 시)

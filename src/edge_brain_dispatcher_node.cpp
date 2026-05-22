@@ -46,6 +46,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/empty.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +57,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -65,10 +67,12 @@ namespace {
 struct Step
 {
   std::string label;
+  std::string model_name;           // Gazebo spawn name (= /grasp/attach/<...> suffix)
   double pick_x, pick_y;            // tool0 target xy (frame_id)
   double pick_yaw_deg;              // tool0 yaw at pick (= th_pick from user table)
-  double place_x, place_y;          // tool0 target xy on pallet
-  double place_yaw_deg;             // tool0 yaw at place (letter world yaw = +90°)
+  double place_center_x, place_center_y;  // desired letter center xy on pallet
+  double place_x, place_y;                // tool0 target xy on pallet
+  double place_yaw_deg;                   // tool0 yaw at place
 };
 
 // letter 마다의 picking 보정값 (사용자 제공 표 기준).
@@ -76,6 +80,8 @@ struct Step
 //   pick_off_x, pick_off_y    : letter 중심 기준 pick 점 offset [m]
 //                               (letter 가 world yaw=0 으로 스폰되므로
 //                                local frame ≡ world frame, 단순 합산으로 적용)
+//                               place 에서는 letter 중심을 pallet cell 에 맞추기 위해
+//                               이 offset 을 다시 tool0 목표점에 반영한다.
 //   pick_yaw_deg              : pick 시 tool0 의 yaw [deg]  (= th_pick)
 struct LetterDef
 {
@@ -96,8 +102,8 @@ constexpr double kAlphabetHeight   = 0.030;
 //           ≈ 0.92 + 0.015 + 0.16 = 1.095
 // 안전 마진 약 0.005 추가하여 기본값 1.10 사용.
 constexpr double kTool0ToFingertip = 0.16;
-constexpr double kDefaultGraspZ    = kPlateTopZ  + kAlphabetHeight / 2.0 + kTool0ToFingertip;
-constexpr double kDefaultPlaceZ    = kPalletTopZ + kAlphabetHeight / 2.0 + kTool0ToFingertip;
+constexpr double kDefaultGraspZ    = kPlateTopZ  + kAlphabetHeight / 2.0 + kTool0ToFingertip + 0.01;
+constexpr double kDefaultPlaceZ    = kPalletTopZ + kAlphabetHeight / 2.0 + kTool0ToFingertip + 0.02;
 
 constexpr double kPalletCenterX    = -0.60;
 constexpr double kPalletCenterY    =  0.35;
@@ -180,8 +186,33 @@ public:
         onDone(msg->data);
       });
 
+    // pick action 종료 신호 (goal_relay_node 가 발행).
+    // success=true → 현재 step 의 letter 에 대해 /grasp/attach/<model> publish
+    //   = DetachableJoint 가 fixed joint 생성 = contact 비용 회피.
+    pick_phase_done_sub_ = create_subscription<std_msgs::msg::Bool>(
+      "pick_phase_done", 10,
+      [this](std_msgs::msg::Bool::SharedPtr msg) {
+        onPickPhaseDone(msg->data);
+      });
+
     steps_ = buildSteps();
     logPlanSummary();
+
+    // ── 모든 attach publisher 를 미리 생성 (discovery race 방지) ──
+    // 이전에는 step 진입 시점에 lazy 생성했는데, 새 publisher 가 만들어진
+    // 직후 onPickPhaseDone 이 publish 하면 ros_gz_bridge 의 subscriber 매칭이
+    // 아직 완료되지 않아 첫 메시지가 dropped 되는 경우가 있었음 (특히
+    // sub 두세 단계 거치는 ROS→Ign bridge 의 경우 매칭에 수십 ms 소요).
+    // → 9 letter 모두 시작 시 publisher 만들어 두면 runSequence (autostart
+    //   2s 후) 시작 시점에 모두 매칭 완료 보장.
+    for (const auto & st : steps_) {
+      const std::string topic = "/grasp/attach/" + st.model_name;
+      attach_pubs_.emplace(
+        st.model_name,
+        create_publisher<std_msgs::msg::Empty>(topic, 10));
+    }
+    RCLCPP_INFO(get_logger(),
+      "[edge_brain] pre-created %zu attach publishers", attach_pubs_.size());
 
     if (get_parameter("autostart").as_bool()) {
       start_timer_ = create_wall_timer(
@@ -238,16 +269,34 @@ private:
       Step st;
       st.label        = s.p.name + " -> (col=" + std::to_string(s.col) +
                         ", row=" + std::to_string(s.row) + ")";
+      // launch alphabet_specs_all 의 -name 인자와 동일해야 함.
+      //   single-letter (A,B,D,G,I,N,R) : "alphabet_<X>"
+      //   duplicate (E1, E2) : "alphabet_E1" / "alphabet_E2"
+      st.model_name   = "alphabet_" + s.p.name;
       st.pick_x       = s.p.spawn_x + s.p.pick_off_x;
       st.pick_y       = s.p.spawn_y + s.p.pick_off_y;
       st.pick_yaw_deg = s.p.pick_yaw_deg;
-      st.place_x      = cell_x(s.col);
-      st.place_y      = cell_y(s.row);
       // place 시 gripper yaw = pick 시 yaw (수송 중 wrist 회전 없음).
       //   예) E : pick yaw = -90° → place yaw = -90° (그 자세 그대로)
       //       D : pick yaw =   0° → place yaw =   0° (회전 없이)
       //   결과적으로 letter 는 pallet 에서 world yaw = 0° (자연 자세) 로 안착.
       st.place_yaw_deg = s.p.pick_yaw_deg;
+
+      st.place_center_x = cell_x(s.col);
+      st.place_center_y = cell_y(s.row);
+
+      // pick_off 는 "letter center -> tool0 grasp point" 벡터다.
+      // pallet cell 은 letter center 목표이므로, place goal(tool0)은
+      // center 에 grasp offset 을 더한 지점이어야 한다. 현재는 pick/place yaw 를
+      // 같게 유지하지만, 향후 place yaw 를 바꿔도 offset 이 함께 회전되도록
+      // yaw 변화량 기준으로 계산한다.
+      const double yaw_delta = deg2rad(st.place_yaw_deg - st.pick_yaw_deg);
+      const double c = std::cos(yaw_delta);
+      const double sn = std::sin(yaw_delta);
+      const double place_off_x = c * s.p.pick_off_x - sn * s.p.pick_off_y;
+      const double place_off_y = sn * s.p.pick_off_x + c * s.p.pick_off_y;
+      st.place_x = st.place_center_x + place_off_x;
+      st.place_y = st.place_center_y + place_off_y;
       steps.push_back(st);
     }
     return steps;
@@ -272,11 +321,47 @@ private:
       const auto & st = steps_[i];
       RCLCPP_INFO(get_logger(),
         "[edge_brain]  step %zu  %s  "
-        "pick=(%.3f, %.3f) yaw=%+.1f°  place=(%.3f, %.3f) yaw=%+.1f°",
+        "pick=(%.3f, %.3f) yaw=%+.1f°  "
+        "place_tool=(%.3f, %.3f) center=(%.3f, %.3f) yaw=%+.1f°",
         i + 1, st.label.c_str(),
         st.pick_x,  st.pick_y,  st.pick_yaw_deg,
-        st.place_x, st.place_y, st.place_yaw_deg);
+        st.place_x, st.place_y,
+        st.place_center_x, st.place_center_y,
+        st.place_yaw_deg);
     }
+  }
+
+  // ───────────────────────────────────────────────────────────
+  // /pick_phase_done 콜백
+  //   pick 성공 직후, 현재 letter 의 /grasp/attach/<model> 토픽으로
+  //   trigger 메시지를 publish. DetachableJoint 가 tool0 ↔ letter
+  //   fixed joint 를 생성하여, place 의 long-distance 이동 동안
+  //   gripper-letter contact 해석 비용을 제거 (RTF 회복).
+  //   pick 실패 시에는 attach 하지 않음.
+  // ───────────────────────────────────────────────────────────
+  void onPickPhaseDone(bool success)
+  {
+    if (!success) {
+      RCLCPP_WARN(get_logger(),
+        "[edge_brain] /pick_phase_done success=false — skip attach");
+      return;
+    }
+    std::string letter;
+    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr pub;
+    {
+      std::lock_guard<std::mutex> lk(attach_mutex_);
+      letter = current_letter_model_;
+      pub    = current_attach_pub_;
+    }
+    if (letter.empty() || !pub) {
+      RCLCPP_WARN(get_logger(),
+        "[edge_brain] /pick_phase_done received but no current letter — ignored");
+      return;
+    }
+    pub->publish(std_msgs::msg::Empty());
+    RCLCPP_INFO(get_logger(),
+      "[edge_brain] /grasp/attach/%s published (letter attached to tool0)",
+      letter.c_str());
   }
 
   // ───────────────────────────────────────────────────────────
@@ -391,6 +476,24 @@ private:
         done_pending_ = true;
       }
 
+      // ── 이번 step letter 의 attach publisher 선택 ─────────────
+      // publisher 들은 모두 생성자에서 사전 생성되어 있음 (discovery race
+      // 회피용). 여기서는 lookup 만.
+      {
+        std::lock_guard<std::mutex> lk(attach_mutex_);
+        current_letter_model_ = st.model_name;
+        auto it = attach_pubs_.find(st.model_name);
+        if (it == attach_pubs_.end()) {
+          RCLCPP_ERROR(get_logger(),
+            "[edge_brain] step %zu: attach publisher for '%s' missing — "
+            "letter will not be attached. Skipping current step.",
+            i + 1, st.model_name.c_str());
+          current_attach_pub_ = nullptr;
+        } else {
+          current_attach_pub_ = it->second;
+        }
+      }
+
       // ── pick / place PoseStamped publish ────────────────────
       const auto stamp = now();
       const auto pick_q  = downwardYawQuat(deg2rad(st.pick_yaw_deg));
@@ -412,8 +515,10 @@ private:
 
       place_pub_->publish(place_msg);
       RCLCPP_INFO(get_logger(),
-        "[edge_brain] /place_goal published  pos=(%.3f, %.3f, %.3f)",
-        st.place_x, st.place_y, place_z);
+        "[edge_brain] /place_goal published  tool=(%.3f, %.3f, %.3f) "
+        "letter_center=(%.3f, %.3f)",
+        st.place_x, st.place_y, place_z,
+        st.place_center_x, st.place_center_y);
 
       // ── /pickplace_done 대기 ────────────────────────────────
       RCLCPP_INFO(get_logger(),
@@ -498,6 +603,15 @@ private:
   std::promise<bool>  done_promise_;
   std::future<bool>   done_future_;
   bool                done_pending_{false};
+
+  // pick_phase_done 구독 + letter 별 attach publisher 캐시.
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr pick_phase_done_sub_;
+  std::mutex          attach_mutex_;
+  std::string         current_letter_model_;
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr   current_attach_pub_;
+  std::unordered_map<
+    std::string,
+    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr> attach_pubs_;
 };
 
 int main(int argc, char ** argv)

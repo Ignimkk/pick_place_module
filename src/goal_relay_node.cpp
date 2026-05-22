@@ -100,6 +100,11 @@ public:
     //   data = false → pick 또는 place 실패
     done_pub_ = create_publisher<std_msgs::msg::Bool>("pickplace_done", 10);
 
+    // pick action 종료 신호 (place 와 분리).
+    // dispatcher 가 이 시점에 /grasp/attach/<letter> 를 publish 하여
+    // long-distance pre-place 이동 전에 fixed joint 를 생성한다.
+    pick_done_pub_ = create_publisher<std_msgs::msg::Bool>("pick_phase_done", 10);
+
     RCLCPP_INFO(get_logger(),
       "[goal_relay] GoalRelayNode started  trigger_mode=%ld",
       get_parameter("trigger_mode").as_int());
@@ -187,11 +192,17 @@ private:
     if (!pick_ok) {
       RCLCPP_ERROR(get_logger(),
         "[goal_relay] pick failed — aborting place (sequence aborted)");
+      publishPickPhaseDone(false);
       publishDone(false);
       resetExecutingFlags();
       return;
     }
     RCLCPP_INFO(get_logger(), "[goal_relay] pick succeeded");
+    // dispatcher 가 attach publish 할 수 있도록 pick 종료 신호 우선 발행.
+    // 200ms grace period 동안 dispatcher 가 /grasp/attach/<letter> 를 보내고,
+    // DetachableJoint 가 fixed joint 를 생성한 뒤 place 시작.
+    publishPickPhaseDone(true);
+    std::this_thread::sleep_for(200ms);
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -221,6 +232,16 @@ private:
     done_pub_->publish(msg);
     RCLCPP_INFO(get_logger(),
       "[goal_relay] /pickplace_done published  success=%s",
+      success ? "true" : "false");
+  }
+
+  void publishPickPhaseDone(bool success)
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = success;
+    pick_done_pub_->publish(msg);
+    RCLCPP_INFO(get_logger(),
+      "[goal_relay] /pick_phase_done published  success=%s",
       success ? "true" : "false");
   }
 
@@ -509,6 +530,7 @@ private:
 
   // ---- done publisher (mode 1 only) ----
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr done_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pick_done_pub_;
 
   // ---- state (mutex_ 로 보호) ----
   geometry_msgs::msg::Pose pick_pose_{};
