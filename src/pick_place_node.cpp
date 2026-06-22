@@ -72,6 +72,7 @@
 #include <pick_place_module/action/traj_opt.hpp>
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -417,6 +418,9 @@ public:
     // self-stall 검출은 "close" 동작에서만 활성화. close 로 간주할 목표 위치 임계.
     //   (gripper_close_pos=0.8 기본이므로 0.4 면 open(0.0) 과 명확히 구분됨)
     declare_parameter<double>("gripper_close_pos_threshold", 0.4);
+    declare_parameter<double>("gripper_open_pos_tolerance", 0.08);
+    declare_parameter<int>("release_repeat_count", 5);
+    declare_parameter<int>("release_repeat_period_ms", 100);
     declare_parameter<double>("cartesian_eef_step",        0.01);
     declare_parameter<double>("cartesian_min_fraction",    0.95);
     declare_parameter<double>("grasp_orientation_x",  0.0);
@@ -520,6 +524,9 @@ public:
             get_parameter("gripper_joint_name").as_string();
           for (size_t i = 0; i < msg->name.size(); ++i) {
             if (msg->name[i] == jname) {
+              if (i < msg->position.size()) {
+                latest_gripper_pos_.store(msg->position[i]);
+              }
               if (i < msg->velocity.size()) {
                 latest_gripper_vel_.store(msg->velocity[i]);
               }
@@ -834,6 +841,8 @@ private:
     const double close_threshold =
       get_parameter("gripper_close_pos_threshold").as_double();
     const bool is_close_action = (position >= close_threshold);
+    const double open_tolerance =
+      get_parameter("gripper_open_pos_tolerance").as_double();
 
     const auto t_start = std::chrono::steady_clock::now();
     auto t_last_movement = t_start;
@@ -865,6 +874,15 @@ private:
             v, self_vel_thresh, self_time_sec);
           return true;
         }
+      } else {
+        const double p = latest_gripper_pos_.load();
+        if (p <= position + open_tolerance) {
+          RCLCPP_INFO(get_logger(),
+            "[gripper] open target reached by joint_state "
+            "(pos=%.4f <= target %.4f + tol %.4f) — treating open as success",
+            p, position, open_tolerance);
+          return true;
+        }
       }
 
       // (3) 전체 timeout
@@ -874,6 +892,24 @@ private:
       }
     }
     return false;
+  }
+
+  void publishReleaseAll()
+  {
+    if (!release_pub_) return;
+    const int count = std::max(1,
+      static_cast<int>(get_parameter("release_repeat_count").as_int()));
+    const int period_ms = std::max(0,
+      static_cast<int>(get_parameter("release_repeat_period_ms").as_int()));
+    for (int i = 0; i < count; ++i) {
+      release_pub_->publish(std_msgs::msg::Empty());
+      if (period_ms > 0 && i + 1 < count) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+      }
+    }
+    RCLCPP_INFO(get_logger(),
+      "[place] /grasp/release_all published x%d (period=%d ms)",
+      count, period_ms);
   }
 
   // ── motion_logger 트리거 ─────────────────────────────────────
@@ -2362,14 +2398,10 @@ private:
     // ── Step 5: release ──
     fb("Step5: Releasing object", 0.75f);
     if (check_cancel()) return;
-    // DetachableJoint 가 letter 를 gripper 에 매달고 있을 수 있으므로
-    // gripper open 직전에 공용 detach 토픽을 한 번 publish.
-    // 현재 attach 상태가 아닌 letter 는 idempotent 하게 무시됨.
-    if (release_pub_) {
-      release_pub_->publish(std_msgs::msg::Empty());
-      RCLCPP_INFO(get_logger(),
-        "[place] /grasp/release_all published (pre-gripper-open)");
-    }
+    // DetachableJoint 가 object 를 gripper 에 매달고 있을 수 있으므로
+    // gripper open 직전에 공용 detach 토픽을 반복 publish.
+    // 현재 attach 상태가 아닌 object 는 idempotent 하게 무시됨.
+    publishReleaseAll();
     if (!controlGripper(grp_open, max_effort, gripper_to)) {
       abort_with("Failed to open gripper at place"); return;
     }
@@ -2485,6 +2517,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
     gripper_joint_state_sub_;
   std::atomic<double> latest_gripper_vel_{1.0};   // 초기값 ≥ stall_thresh → false-trigger 방지
+  std::atomic<double> latest_gripper_pos_{1.0};   // 초기값 closed 쪽 → open false-trigger 방지
   rclcpp::CallbackGroup::SharedPtr trajopt_cbg_;
 
   std::mutex exec_mutex_;

@@ -203,6 +203,7 @@ install(
     scripts/plot_results.py
     scripts/analyze_results.py
     scripts/preview_alphabet_collision.py
+    scripts/openvla_block_episode.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -7,14 +7,21 @@ pick_place_module 의 노드를 기동:
   - motion_logger_node : EE 이동 거리 + 관절 이동량 기록 (선택, 기본 활성)
 
 전제조건:
-  ur_setup_bringup 의 ur_sim_moveit_robotiq_ur16e.launch.py 가 먼저 실행되어
-  move_group, robot_state_publisher, controller_manager 가 구동 중이어야 함.
+  ur_setup_bringup 의 다음 중 하나가 먼저 실행되어
+  move_group, robot_state_publisher, controller_manager 가 구동 중이어야 함:
+    - ur_sim_moveit_robotiq_ur16e.launch.py   (use_sim:=true,  기본)
+    - ur_real_moveit_robotiq_ur16e.launch.py  (use_sim:=false, 실물)
 
 런치 인수:
-  trigger_mode    : 0(기본) = 토픽 하나만 받아도 즉시 해당 action 실행
-                    1        = pick_goal + place_goal 모두 수신 후 순차 실행
-  use_sim_time    : true(기본) / false
-  enable_logger   : true(기본) = motion_logger_node 활성화
+  use_sim         : true(기본)=Gazebo + use_sim_time=true,
+                    false=실물 UR16e + use_sim_time=false
+  trigger_mode    : 0(기본)=토픽 하나만 받아도 즉시 해당 action 실행
+                    1=pick_goal + place_goal 모두 수신 후 순차 실행
+  enable_logger   : true(기본)=motion_logger_node 활성화
+  launch_pick_place_node :
+                    true(기본)=pick_place_node 실행.
+                    false=노드 미실행 → MoveIt RViz panel 로 수동 plan/execute 가능
+                    (자동 모션 없는 dry-run 검증용).
 """
 
 import os
@@ -23,9 +30,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
-from ur_moveit_config.launch_common import load_yaml
 
 
 def generate_launch_description():
@@ -35,88 +41,77 @@ def generate_launch_description():
     config     = os.path.join(pkg_share,     "config", "pick_place_params.yaml")
     kinematics = os.path.join(bringup_share, "config", "kinematics.yaml")
 
-    trigger_mode   = LaunchConfiguration("trigger_mode")
-    use_sim_time   = LaunchConfiguration("use_sim_time")
-    enable_logger  = LaunchConfiguration("enable_logger")
+    use_sim                = LaunchConfiguration("use_sim")
+    trigger_mode           = LaunchConfiguration("trigger_mode")
+    enable_logger          = LaunchConfiguration("enable_logger")
+    launch_pick_place_node = LaunchConfiguration("launch_pick_place_node")
+
+    # use_sim → use_sim_time 매핑 (string).
+    # PythonExpression 으로 "true"/"false" 문자열을 그대로 use_sim_time 으로 전달.
+    use_sim_time = PythonExpression([
+        "'true' if '", use_sim, "' == 'true' else 'false'"
+    ])
 
     return LaunchDescription([
         # --------------------------------------------------------
-        # 런치 인수 선언
+        # 런치 인수
         # --------------------------------------------------------
         DeclareLaunchArgument(
-            "trigger_mode",
-            default_value="0",
-            description=(
-                "실행 트리거 모드: "
-                "0=pick_goal 또는 place_goal 중 하나만 받아도 즉시 해당 action 실행, "
-                "1=pick_goal + place_goal 모두 수신 후 pick → place 순차 실행"
-            ),
+            "use_sim", default_value="true",
+            description="true: Gazebo 시뮬레이션 (use_sim_time=true), "
+                        "false: 실물 UR16e + Robotiq (use_sim_time=false).",
         ),
         DeclareLaunchArgument(
-            "use_sim_time",
-            default_value="true",
-            description="시뮬레이션 시간 사용 여부 (Gazebo 연동 시 true)",
+            "trigger_mode", default_value="0",
+            description="0=pick_goal/place_goal 단일 트리거 즉시 실행, "
+                        "1=둘 다 수신 후 순차 실행.",
         ),
         DeclareLaunchArgument(
-            "enable_logger",
-            default_value="true",
-            description="motion_logger_node 활성화 여부 (EE 이동 거리 + 관절 이동량 기록)",
+            "enable_logger", default_value="true",
+            description="motion_logger_node 활성화 여부.",
         ),
         DeclareLaunchArgument(
-            "experiment_mode",
-            default_value="rrt_trajopt",
+            "launch_pick_place_node", default_value="true",
+            description="false 로 두면 pick_place_node 미실행. "
+                        "실물에서 자동 모션 없이 MoveIt RViz panel 로 수동 plan/execute 검증할 때 사용.",
+        ),
+        DeclareLaunchArgument(
+            "experiment_mode", default_value="rrt_trajopt",
             description="실험 모드: rrt_only / trajopt_only / rrt_trajopt",
         ),
         DeclareLaunchArgument(
-            "experiment_csv_path",
-            default_value="",
+            "experiment_csv_path", default_value="",
             description="실험 결과 CSV 저장 경로",
         ),
 
         # --------------------------------------------------------
         # pick_place_node
-        # MoveIt2 RRTConnect + Cartesian 경로 기반 action server
-        #
-        # kinematics.yaml 로드 이유:
-        #   MoveGroupInterface 가 IK 플러그인(KDLKinematicsPlugin)을 인식하고
-        #   Cartesian pose 계획을 실행하기 위해 필수.
-        #   누락 시: "No kinematics plugins defined" 경고 → planning abort.
         # --------------------------------------------------------
         Node(
             package="pick_place_module",
             executable="pick_place_node",
-            # name=... 을 명시하지 않는다.
-            # main() 이 두 노드를 만드는데
-            #   1) "pick_place_move_group_interface" (MoveGroupInterface 보조)
-            #   2) "pick_place_node"                  (PickPlaceNode 자체)
-            # 여기서 name="pick_place_node" 를 주면 ROS2 launch_ros 가
-            # `--ros-args -r __node:=pick_place_node` 를 추가하여 **두 노드
-            # 모두**의 이름을 동일하게 덮어쓴다. 그 결과 ros2 graph 에
-            # `/pick_place_node` 가 두 번 등장하며 set_parameters service
-            # 호출이 두 endpoint 사이에 random dispatch 되어 cycle 마다
-            # planner_id 적용 여부가 불안정해진다.
             output="screen",
+            condition=IfCondition(launch_pick_place_node),
             parameters=[
                 config,
                 kinematics,
                 {
-                    "use_sim_time": use_sim_time,
-                    "experiment_mode": LaunchConfiguration("experiment_mode"),
-                    "experiment_csv_path": LaunchConfiguration("experiment_csv_path"),
-                }
+                    "use_sim_time":         use_sim_time,
+                    "experiment_mode":      LaunchConfiguration("experiment_mode"),
+                    "experiment_csv_path":  LaunchConfiguration("experiment_csv_path"),
+                },
             ],
         ),
 
         # --------------------------------------------------------
         # goal_relay_node
-        # pick_goal / place_goal 토픽 수신 → pick / place action goal 전송
-        # trigger_mode 는 런치 인수로 오버라이드 (YAML 기본값보다 우선)
         # --------------------------------------------------------
         Node(
             package="pick_place_module",
             executable="goal_relay_node",
             name="goal_relay_node",
             output="screen",
+            condition=IfCondition(launch_pick_place_node),
             parameters=[
                 config,
                 {
@@ -128,9 +123,6 @@ def generate_launch_description():
 
         # --------------------------------------------------------
         # motion_logger_node
-        # /joint_states + TF2(base_link → tool0) 기반
-        # EE 이동 거리 및 관절 이동량을 CSV로 기록
-        # enable_logger:=false 로 비활성화 가능
         # --------------------------------------------------------
         Node(
             package="pick_place_module",
