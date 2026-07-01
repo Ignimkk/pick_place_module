@@ -66,6 +66,7 @@
 #include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
+#include <ur_msgs/srv/set_io.hpp>
 
 #include <pick_place_module/action/pick.hpp>
 #include <pick_place_module/action/place.hpp>
@@ -393,6 +394,14 @@ public:
     declare_parameter<double>("pre_grasp_offset",          0.10);
     declare_parameter<double>("gripper_open_pos",          0.4);
     declare_parameter<double>("gripper_close_pos",         0.7);
+    declare_parameter<std::string>("gripper_control_backend", "action");
+    declare_parameter<std::string>(
+      "gripper_io_service", "/io_and_status_controller/set_io");
+    declare_parameter<int>("gripper_io_pin", 1);
+    declare_parameter<bool>("gripper_io_close_value", true);
+    declare_parameter<bool>("gripper_io_open_value", false);
+    declare_parameter<double>("gripper_io_wait_sec", 1.0);
+    declare_parameter<double>("gripper_io_call_timeout_sec", 2.0);
     declare_parameter<double>("velocity_scaling",          0.3);
     declare_parameter<double>("acceleration_scaling",      0.3);
     declare_parameter<double>("planning_time",             10.0);
@@ -491,6 +500,8 @@ public:
       get_parameter("use_trajopt").as_bool() ? "true" : "false");
     RCLCPP_INFO(get_logger(), "planner_id (init)   : %s",
       get_parameter("planner_id").as_string().c_str());
+    RCLCPP_INFO(get_logger(), "gripper backend     : %s",
+      get_parameter("gripper_control_backend").as_string().c_str());
     RCLCPP_INFO(get_logger(), "experiment_mode     : %s",
       get_parameter("experiment_mode").as_string().c_str());
     RCLCPP_INFO(get_logger(), "experiment CSV      : %s",
@@ -507,6 +518,10 @@ public:
     // ── gripper action client ─────────────────────────────────────
     gripper_client_ = rclcpp_action::create_client<GripperCommand>(
       this, "robotiq_gripper_controller/gripper_cmd", gripper_cbg_);
+    gripper_io_client_ = create_client<ur_msgs::srv::SetIO>(
+      get_parameter("gripper_io_service").as_string(),
+      rmw_qos_profile_services_default,
+      gripper_cbg_);
 
     // ── DetachableJoint 공용 release 토픽 publisher ─────────────────
     // place 의 gripper open 직전에 한 번 publish 하여 attached letter 를
@@ -791,8 +806,100 @@ private:
   }
 
   // ── 그리퍼 제어 ───────────────────────────────────────────────
+  bool controlGripperByUrIo(double position, double timeout_sec)
+  {
+    if (!gripper_io_client_->wait_for_service(std::chrono::seconds(5))) {
+      RCLCPP_ERROR(get_logger(),
+        "UR IO service not available: %s",
+        get_parameter("gripper_io_service").as_string().c_str());
+      return false;
+    }
+
+    const double close_threshold =
+      get_parameter("gripper_close_pos_threshold").as_double();
+    const bool is_close_action = (position >= close_threshold);
+    const bool close_value = get_parameter("gripper_io_close_value").as_bool();
+    const bool open_value = get_parameter("gripper_io_open_value").as_bool();
+    const bool target_value = is_close_action ? close_value : open_value;
+
+    auto request = std::make_shared<ur_msgs::srv::SetIO::Request>();
+    request->fun = request->FUN_SET_DIGITAL_OUT;
+    const int io_pin = static_cast<int>(get_parameter("gripper_io_pin").as_int());
+    switch (io_pin) {
+      case 0: request->pin = request->PIN_DOUT0; break;
+      case 1: request->pin = request->PIN_DOUT1; break;
+      case 2: request->pin = request->PIN_DOUT2; break;
+      case 3: request->pin = request->PIN_DOUT3; break;
+      case 4: request->pin = request->PIN_DOUT4; break;
+      case 5: request->pin = request->PIN_DOUT5; break;
+      case 6: request->pin = request->PIN_DOUT6; break;
+      case 7: request->pin = request->PIN_DOUT7; break;
+      default:
+        RCLCPP_ERROR(get_logger(), "Invalid gripper_io_pin. Expected 0..7.");
+        return false;
+    }
+    request->state = target_value ? 1.0 : 0.0;
+
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto future = promise->get_future();
+    gripper_io_client_->async_send_request(
+      request,
+      [promise](rclcpp::Client<ur_msgs::srv::SetIO>::SharedFuture response) {
+        promise->set_value(response.get() && response.get()->success);
+      });
+
+    const auto call_deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration<double>(
+        get_parameter("gripper_io_call_timeout_sec").as_double());
+    while (rclcpp::ok()) {
+      if (future.wait_for(std::chrono::milliseconds(50)) ==
+          std::future_status::ready)
+      {
+        const bool ok = future.get();
+        if (!ok) {
+          RCLCPP_ERROR(get_logger(),
+            "[gripper:ur_io] set_io returned failure for DOUT%d=%s",
+            io_pin,
+            target_value ? "true" : "false");
+          return false;
+        }
+        break;
+      }
+      if (std::chrono::steady_clock::now() > call_deadline) {
+        RCLCPP_ERROR(get_logger(), "[gripper:ur_io] set_io call timed out");
+        return false;
+      }
+    }
+
+    const double wait_sec = std::min(
+      timeout_sec,
+      std::max(0.0, get_parameter("gripper_io_wait_sec").as_double()));
+    if (wait_sec > 0.0) {
+      std::this_thread::sleep_for(std::chrono::duration<double>(wait_sec));
+    }
+    RCLCPP_INFO(get_logger(),
+      "[gripper:ur_io] DOUT%d=%s (%s command)",
+      io_pin,
+      target_value ? "true" : "false",
+      is_close_action ? "close" : "open");
+    return true;
+  }
+
   bool controlGripper(double position, double max_effort, double timeout_sec)
   {
+    std::string backend = get_parameter("gripper_control_backend").as_string();
+    std::transform(backend.begin(), backend.end(), backend.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (backend == "ur_io" || backend == "io" || backend == "digital_out") {
+      return controlGripperByUrIo(position, timeout_sec);
+    }
+    if (backend != "action") {
+      RCLCPP_ERROR(get_logger(),
+        "Unknown gripper_control_backend '%s'. Use 'action' or 'ur_io'.",
+        backend.c_str());
+      return false;
+    }
+
     if (!gripper_client_->wait_for_action_server(std::chrono::seconds(5))) {
       RCLCPP_ERROR(get_logger(), "Gripper action server not available");
       return false;
@@ -2507,6 +2614,7 @@ private:
   rclcpp_action::Server<Pick>::SharedPtr               pick_server_;
   rclcpp_action::Server<Place>::SharedPtr              place_server_;
   rclcpp_action::Client<GripperCommand>::SharedPtr     gripper_client_;
+  rclcpp::Client<ur_msgs::srv::SetIO>::SharedPtr       gripper_io_client_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr   release_pub_;
   rclcpp_action::Client<TrajOpt>::SharedPtr            trajopt_client_;
 

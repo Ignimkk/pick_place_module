@@ -20,6 +20,16 @@ pick_place_node:
     gripper_open_pos:  0.0
     gripper_close_pos: 0.7
 
+    # action: robotiq_gripper_controller/GripperCommand 사용 (시뮬레이션/직접 Modbus)
+    # ur_io : UR Driver IO service로 digital_out[1] 토글 (실물 기본)
+    gripper_control_backend: "action"
+    gripper_io_service: "/io_and_status_controller/set_io"
+    gripper_io_pin: 1
+    gripper_io_close_value: true
+    gripper_io_open_value: false
+    gripper_io_wait_sec: 1.0
+    gripper_io_call_timeout_sec: 2.0
+
     # 그리퍼 최대 토크 [N]
     gripper_max_effort: 50.0
 

@@ -53,12 +53,19 @@ def generate_launch_description():
     enable_logger          = LaunchConfiguration("enable_logger")
     launch_pick_place_node = LaunchConfiguration("launch_pick_place_node")
     enable_experiment_csv  = LaunchConfiguration("enable_experiment_csv")
+    gripper_control_backend = LaunchConfiguration("gripper_control_backend")
 
     # use_sim_time:=auto 이면 기존 use_sim 값을 사용하고,
     # true/false 를 직접 넘기면 그 값을 우선한다.
     use_sim_time = PythonExpression([
         "'", use_sim_time_arg, "' if '", use_sim_time_arg,
         "' != 'auto' else ('true' if '", use_sim, "' == 'true' else 'false')"
+    ])
+    gripper_backend_effective = PythonExpression([
+        "'", gripper_control_backend, "' if '", gripper_control_backend,
+        "' != 'auto' else ('ur_io' if (('", use_sim_time_arg,
+        "' == 'false') or ('", use_sim_time_arg, "' == 'auto' and '",
+        use_sim, "' == 'false')) else 'action')"
     ])
 
     return LaunchDescription([
@@ -100,6 +107,10 @@ def generate_launch_description():
             "enable_experiment_csv", default_value="true",
             description="false이면 pick_place_node 실험 CSV 파일을 생성하지 않음.",
         ),
+        DeclareLaunchArgument(
+            "gripper_control_backend", default_value="auto",
+            description="auto/action/ur_io. auto이면 use_sim_time=false에서 ur_io, 그 외 action.",
+        ),
 
         # --------------------------------------------------------
         # pick_place_node
@@ -117,6 +128,7 @@ def generate_launch_description():
                     "experiment_mode":      LaunchConfiguration("experiment_mode"),
                     "enable_experiment_csv": enable_experiment_csv,
                     "experiment_csv_path":  LaunchConfiguration("experiment_csv_path"),
+                    "gripper_control_backend": gripper_backend_effective,
                 },
             ],
         ),
