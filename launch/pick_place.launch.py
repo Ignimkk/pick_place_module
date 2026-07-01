@@ -13,11 +13,17 @@ pick_place_module 의 노드를 기동:
     - ur_real_moveit_robotiq_ur16e.launch.py  (use_sim:=false, 실물)
 
 런치 인수:
-  use_sim         : true(기본)=Gazebo + use_sim_time=true,
+  use_sim_time    : true=Gazebo 시뮬레이션 시간, false=실물 시간,
+                    auto(기본)=use_sim 값으로부터 결정
+  use_sim         : use_sim_time:=auto 일 때만 사용되는 호환 인수.
+                    true(기본)=Gazebo + use_sim_time=true,
                     false=실물 UR16e + use_sim_time=false
   trigger_mode    : 0(기본)=토픽 하나만 받아도 즉시 해당 action 실행
                     1=pick_goal + place_goal 모두 수신 후 순차 실행
   enable_logger   : true(기본)=motion_logger_node 활성화
+  enable_experiment_csv :
+                    true(기본)=pick_place_node 실험 CSV 활성화,
+                    false=실험 CSV 파일 미생성
   launch_pick_place_node :
                     true(기본)=pick_place_node 실행.
                     false=노드 미실행 → MoveIt RViz panel 로 수동 plan/execute 가능
@@ -42,14 +48,17 @@ def generate_launch_description():
     kinematics = os.path.join(bringup_share, "config", "kinematics.yaml")
 
     use_sim                = LaunchConfiguration("use_sim")
+    use_sim_time_arg       = LaunchConfiguration("use_sim_time")
     trigger_mode           = LaunchConfiguration("trigger_mode")
     enable_logger          = LaunchConfiguration("enable_logger")
     launch_pick_place_node = LaunchConfiguration("launch_pick_place_node")
+    enable_experiment_csv  = LaunchConfiguration("enable_experiment_csv")
 
-    # use_sim → use_sim_time 매핑 (string).
-    # PythonExpression 으로 "true"/"false" 문자열을 그대로 use_sim_time 으로 전달.
+    # use_sim_time:=auto 이면 기존 use_sim 값을 사용하고,
+    # true/false 를 직접 넘기면 그 값을 우선한다.
     use_sim_time = PythonExpression([
-        "'true' if '", use_sim, "' == 'true' else 'false'"
+        "'", use_sim_time_arg, "' if '", use_sim_time_arg,
+        "' != 'auto' else ('true' if '", use_sim, "' == 'true' else 'false')"
     ])
 
     return LaunchDescription([
@@ -60,6 +69,10 @@ def generate_launch_description():
             "use_sim", default_value="true",
             description="true: Gazebo 시뮬레이션 (use_sim_time=true), "
                         "false: 실물 UR16e + Robotiq (use_sim_time=false).",
+        ),
+        DeclareLaunchArgument(
+            "use_sim_time", default_value="auto",
+            description="true/false 직접 지정. auto이면 use_sim 값으로부터 결정.",
         ),
         DeclareLaunchArgument(
             "trigger_mode", default_value="0",
@@ -81,7 +94,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "experiment_csv_path", default_value="",
-            description="실험 결과 CSV 저장 경로",
+            description="실험 결과 CSV 저장 경로. 비우면 자동 경로 사용.",
+        ),
+        DeclareLaunchArgument(
+            "enable_experiment_csv", default_value="true",
+            description="false이면 pick_place_node 실험 CSV 파일을 생성하지 않음.",
         ),
 
         # --------------------------------------------------------
@@ -98,6 +115,7 @@ def generate_launch_description():
                 {
                     "use_sim_time":         use_sim_time,
                     "experiment_mode":      LaunchConfiguration("experiment_mode"),
+                    "enable_experiment_csv": enable_experiment_csv,
                     "experiment_csv_path":  LaunchConfiguration("experiment_csv_path"),
                 },
             ],

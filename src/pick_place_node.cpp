@@ -450,6 +450,8 @@ public:
     // "trajopt_only": IK → TrajOpt (RRT 경로 미사용, Hermite 초기 추정)
     // "rrt_trajopt" : RRTConnect → TrajOpt → publish  (기본)
     declare_parameter<std::string>("experiment_mode", "rrt_trajopt");
+    // false이면 실험 CSV 파일을 생성하지 않는다.
+    declare_parameter<bool>("enable_experiment_csv", true);
     // CSV 저장 경로 (비워두면 ~/.ros/pick_place_exp/TIMESTAMP_results.csv)
     declare_parameter<std::string>("experiment_csv_path", "");
 
@@ -491,6 +493,8 @@ public:
       get_parameter("planner_id").as_string().c_str());
     RCLCPP_INFO(get_logger(), "experiment_mode     : %s",
       get_parameter("experiment_mode").as_string().c_str());
+    RCLCPP_INFO(get_logger(), "experiment CSV      : %s",
+      get_parameter("enable_experiment_csv").as_bool() ? "enabled" : "disabled");
 
     // ── callback groups ───────────────────────────────────────────
     // gripper 콜백은 pick·place 시퀀스가 arm 동작을 대기하는 동안에도
@@ -608,10 +612,14 @@ public:
       "/ee_path/planned", rclcpp::QoS(1).transient_local());
 
     // ── CSV 로거 초기화 ───────────────────────────────────────────
-    std::string csv_path = get_parameter("experiment_csv_path").as_string();
-    if (csv_path.empty()) csv_path = defaultCsvPath();
-    csv_logger_ = std::make_shared<CsvLogger>(csv_path);
-    RCLCPP_INFO(get_logger(), "Experiment CSV      : %s", csv_path.c_str());
+    if (get_parameter("enable_experiment_csv").as_bool()) {
+      std::string csv_path = get_parameter("experiment_csv_path").as_string();
+      if (csv_path.empty()) csv_path = defaultCsvPath();
+      csv_logger_ = std::make_shared<CsvLogger>(csv_path);
+      RCLCPP_INFO(get_logger(), "Experiment CSV path : %s", csv_path.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "Experiment CSV path : disabled");
+    }
 
     // ── PlanningSceneMonitor (충돌 검사용) ──────────────────────
     // move_group_node 가 robot_description 을 보유하므로 이를 재사용한다.

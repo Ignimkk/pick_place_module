@@ -15,3 +15,18 @@ __pycache__/
 
 # Experiment logs
 data/motion_log_*.csv
+
+# Generated CSV files
+*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local cache and tool files
+.cache/
+.codex
+.codex/
